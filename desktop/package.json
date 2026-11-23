@@ -1,0 +1,46 @@
+{
+  "name": "msgt-viewer-desktop",
+  "version": "1.0.0",
+  "description": "Desktop edition of MSGT Viewer",
+  "author": "Aether10n",
+  "main": "main.cjs",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^39.2.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.aetherion.msgtviewer",
+    "productName": "MSGT Viewer",
+    "asar": true,
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "icon.png",
+      { "from": "../site", "to": "site" }
+    ],
+    "directories": { "output": "dist" },
+    "win": {
+      "target": ["portable"],
+      "icon": "icon.png",
+      "artifactName": "MSGT-Viewer-${version}-Windows-${arch}.${ext}"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "icon.png",
+      "category": "public.app-category.entertainment",
+      "artifactName": "MSGT-Viewer-${version}-macOS-${arch}.${ext}"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "icon": "icon.png",
+      "category": "Utility",
+      "artifactName": "MSGT-Viewer-${version}-Linux-${arch}.${ext}"
+    }
+  }
+}

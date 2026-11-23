@@ -1,0 +1,7 @@
+node_modules/
+web/node_modules
+web/meta.json
+desktop/node_modules/
+desktop/dist/
+desktop/release-dist/
+desktop/dist-stale/

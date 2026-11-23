@@ -1,0 +1,580 @@
+// Pianta Village's own map objects (MoveBG/MapObjMonte.cpp): the jump mushrooms, the hanging bridge
+// under the village (its boards sag under Mario and pull their neighbours down with them), the
+// swinging boards (spraying while standing on one rocks it), the goal flag of the race and the
+// dandelion fluff (drifting down, blown along by the wind when the big one passes the trigger
+// height, coming back somewhere random). Also the breakable hidden objects of MapObjHide.cpp
+// these stages use: the wooden boxes (ground-pounding one breaks the ones beside it too) and the
+// watermelon blocks.
+//
+// The ropes of the bridge and the swinging boards are GX strips the game draws itself (drawRopes,
+// drawRopeBetweenBoards, TSwingBoard::draw); they aren't drawn here.
+
+import { sinf as mslSinf, cosf as mslCosf } from '../math.js';
+import { V } from '../version.js';
+import { MSF } from '../flags.js';
+import { fr, V3, Mtx, mtx, MsRandF, MsMtxSetXYZRPH, jgInvSqrt } from '../math.js';
+import { fmadd as FMA, fmsub as FMS, fmadd, fnmsub } from '../player/fmath.js';
+import { vNormMs } from '../vecops.js';
+import { World, Stream, NameRef, HitActor, LF, HF, MSG } from '../engine.js';
+import { AT } from '../actortypes.js';
+import { register } from '../scene.js';
+import { SE } from '../soundids.js';
+import '../sound.js';
+import { MapObjBase, STATE_NORMAL, mapObjGlobals, newAndRegisterObj, UNIQUE_MAKERS } from './base.js';
+import { HideObjBase } from './hide.js';
+import { MsMtxSetRotY, MTXConcat, makeRootMtxRot, setRootMtx, getWaterPos, marioWaterGun } from './lib.js';
+import { LeanBlock } from './bianco.js';
+
+const STATE_UNK2 = 2, STATE_UNK3 = 3, STATE_UNK4 = 4;
+/** sinf / cosf of an f32, rounded to f32 (the game's calls of the C library) */
+/** 3.14f */
+const PI_314 = fr(3.14);
+const sinf = (a: number) => mslSinf(fr(a)), cosf = (a: number) => mslCosf(fr(a));   // (MSL's: math.ts)
+
+// ---------------------------------------------------------------- TMapObjMonteRoot
+export class MapObjMonteRoot extends MapObjBase {
+    initMapObj() {
+        super.initMapObj();
+        this.damageHeight = fr(1400 * this.scale.y);
+        this.calcEntryRadius();
+        this.pos.y = fr(this.initialPos.y + this.yOffset);
+    }
+}
+
+// ---------------------------------------------------------------- TJumpMushroom
+export class JumpMushroom extends MapObjBase {
+    receiveMessage(_sender: HitActor, _msg: number) { this.startAnim(1); return true; }
+    load(s: Stream) {
+        super.load(s);
+        const data = s.s32();
+        const a = this.colMgr && this.colMgr.getActiveCollision();
+        if (a) a.setAllData(data);
+    }
+}
+
+// ---------------------------------------------------------------- THangingBridgeBoard
+export class HangingBridgeBoard extends LeanBlock {
+    static mMarioAccelY = fr(0.15); static mMarioHipDropAccelY = 2; static mReturnAccelRate = fr(0.005); static mSpeedDownRate = fr(0.98);
+    static mRopeWidthX = 10; static mRopeWidthZ = 7; static mTexPosRate = fr(0.01);
+    bridge: HangingBridge | null = null;
+    prev: HangingBridgeBoard | null = null; next: HangingBridgeBoard | null = null;
+    prev2: HangingBridgeBoard | null = null; next2: HangingBridgeBoard | null = null;
+    /** unk1A4: where its two ropes hang from */
+    ropes = [new V3(), new V3()];
+    constructor(w: World, name = 'つり橋の板') { super(w, name); }
+    push(v: number) { this.vel.y = fr(this.vel.y - v); }
+    pushNeighbor(v: number) {
+        const B = this.bridge!;
+        if (this.prev) { this.prev.push(fr(v * B.unk40)); if (this.prev2) this.prev2.push(fr(v * B.unk44)); }
+        if (this.next) { this.next.push(fr(v * B.unk40)); if (this.next2) this.next2.push(fr(v * B.unk44)); }
+    }
+    control() {
+        super.control();
+        const H = HangingBridgeBoard;
+        if (this.marioIsOn()) { this.push(H.mMarioAccelY); this.pushNeighbor(H.mMarioAccelY); }
+        if (this.marioHipAttack()) { this.push(H.mMarioHipDropAccelY); this.pushNeighbor(H.mMarioHipDropAccelY); }
+        this.pos.y = fr(this.pos.y + this.vel.y);
+        this.vel.y = fmadd(H.mReturnAccelRate, fr(this.initialPos.y - this.pos.y), this.vel.y);   // (fmadds: JP 0x801CCD44)
+        this.vel.y = fr(this.vel.y * H.mSpeedDownRate);
+        const m = this.rootMtx(), w = this.bridge ? this.bridge.unk3C : 0;
+        // (JP 0x801CCD68: each a fnmsubs / fmadds)
+        this.ropes[0].set(fnmsub(m[0], w, this.pos.x), fr(70 + fnmsub(m[4], w, this.pos.y)), fnmsub(m[8], w, this.pos.z));
+        this.ropes[1].set(fmadd(m[0], w, this.pos.x), fr(70 + fmadd(m[4], w, this.pos.y)), fmadd(m[8], w, this.pos.z));
+    }
+    calcDefaultMtx() {
+        const rx = makeRootMtxRot(this, 'x'), ry = makeRootMtxRot(this, 'y');
+        MTXConcat(ry, rx, ry);
+        this.defaultMtx = ry;
+        this.vel.y = 0;
+        this.pos.y = this.initialPos.y;
+    }
+    /** THangingBridgeBoard::setGroundCollision: with a hatched Yoshi over it, the collision follows the board's matrix */
+    setGroundCollision() {
+        if (this.yoshiHatchedOver()) { if (this.colMgr) this.colMgr.moveActiveCollisionMtx(this.rootMtx()); }
+        else super.setGroundCollision();
+    }
+    initMapObj() {
+        super.initMapObj();
+        this.unk140 = fr(0.01); this.unk144 = fr(0.02); this.unk148 = fr(0.08);
+    }
+}
+UNIQUE_MAKERS.set('HangingBridgeBoard', (w) => new HangingBridgeBoard(w));
+UNIQUE_MAKERS.set('PinnaHangingBridgeBoard', (w) => new HangingBridgeBoard(w));
+
+// ---------------------------------------------------------------- THangingBridge (a TViewObj)
+const MONTE_BOARDS: [number, number, number, number][] = [
+    [0, -130, 11965, 30], [0, -275, 12225, 29], [0, -415, 12490, 28], [0, -540, 12760, 26], [0, -660, 13035, 24], [0, -770, 13315, 22],
+    [0, -875, 13595, 20], [0, -960, 13895, 12], [0, -1020, 14190, 8], [0, -1060, 14490, 4], [0, -1090, 14790, 2], [0, -1090, 15090, 0],
+    [0, -1080, 15395, -4], [0, -1040, 15695, -6], [0, -995, 15990, -8], [0, -945, 16285, -8], [0, -900, 16580, -8], [0, -855, 16880, -8],
+    [0, -800, 17175, -10], [-1, 0, 0, 0], [-99999, 0, 0, 0],
+];
+export class HangingBridge extends NameRef {
+    static mRopeHeight = 0;
+    boards: HangingBridgeBoard[] = [];
+    unk18 = new V3(); unk24 = new V3(); unk30 = [0, 0];
+    unk3C = 0; unk40 = 0; unk44 = 0;
+    constructor(public world: World, name = 'つり橋') { super(name); (world as any).hangingBridge = this; }
+    static mRopeWidthBetweenBoards = 10; static mRopeWidthBetweenBoardsY = 10; static mPointNumBetweenBoards = 10;
+    static mBetweenBoardsTexPosRate = fr(0.01);
+    /** unk38: the rope's sag at each point between two boards */
+    unk38: number[] = [];
+    /** perform: CUE_DRAW only (initDraw, each board's drawRopes, drawRopeBetweenBoards): see ropeStrips */
+    perform(_cue: number) { }
+    /** drawLowerMinus / drawLowerPlus / drawUpper (kind 0 / 1 / 2): param_4 pairs of [x, y, z, s, t] */
+    private drawPart(kind: number, a: V3, b: V3, w: number[], n: number, out: number[]) {
+        const H = HangingBridge, rate = fr(1 / n);
+        let x = a.x, y = a.y, z = a.z;
+        const sx = fr(rate * fr(b.x - x)), sy = fr(rate * fr(b.y - y)), sz = fr(rate * fr(b.z - z));
+        for (let i = 0; i < n; i++) {
+            const h = fr(y - this.unk38[i]), t = fr(H.mBetweenBoardsTexPosRate * fr(x + z));
+            const lo = fr(h - H.mRopeWidthBetweenBoardsY);
+            if (kind === 0) out.push(fr(x - w[0]), h, fr(z - w[1]), 0, t, x, lo, z, 1, t);
+            else if (kind === 1) out.push(x, lo, z, 0, t, fr(x + w[0]), h, fr(z + w[1]), 1, t);
+            else out.push(fr(x + w[0]), h, fr(z + w[1]), 0, t, fr(x - w[0]), h, fr(z - w[1]), 1, t);
+            x = fr(x + sx); y = fr(y + sy); z = fr(z + sz);
+        }
+    }
+    /** drawRopeBetweenBoards(height, n): six strips (each side's lower minus, lower plus, upper) */
+    private drawRopeBetweenBoards(h: number, n: number, out: Float32Array[]) {
+        const xw = fr(this.unk30[0] * this.unk3C), zw = fr(this.unk30[1] * this.unk3C);
+        const w = [fr(this.unk30[0] * HangingBridge.mRopeWidthBetweenBoards), fr(this.unk30[1] * HangingBridge.mRopeWidthBetweenBoards)];
+        for (const side of [0, 1]) {
+            const sg = side === 0 ? 1 : -1;
+            for (const kind of [0, 1, 2]) {
+                const v: number[] = [];
+                let prev = new V3(fr(this.unk18.x + sg * xw), fr(this.unk18.y + h), fr(this.unk18.z + sg * zw));
+                for (const b of this.boards) {
+                    const cur = b.ropes[side].clone(); cur.y = fr(cur.y + h);   // (setDrawPos)
+                    this.drawPart(kind, prev, cur, w, n, v); prev = cur;
+                }
+                const cur = new V3(fr(this.unk24.x + sg * xw), fr(this.unk24.y + h), fr(this.unk24.z + sg * zw));
+                this.drawPart(kind, prev, cur, w, n, v); prev = cur;
+                this.drawPart(kind, prev, cur, w, n, v);
+                out.push(new Float32Array(v));
+            }
+        }
+    }
+    /** THangingBridgeBoard::drawOneRope at p: an 8-vertex strip round the hanging rope */
+    private static drawOneRope(p: V3, out: Float32Array[]) {
+        const B = HangingBridgeBoard;
+        const xp = fr(p.x + B.mRopeWidthX), xm = fr(p.x - B.mRopeWidthX), zp = fr(p.z + B.mRopeWidthZ), zm = fr(p.z - B.mRopeWidthZ);
+        const by = p.y, ty = fr(p.y + HangingBridge.mRopeHeight);
+        const tt = fr(B.mTexPosRate * fr(ty - p.y)), bt = fr(B.mTexPosRate * fr(by - p.y));
+        out.push(new Float32Array([p.x, ty, zp, 0, tt, p.x, by, zp, 0, bt, xm, ty, zm, 1, tt, xm, by, zm, 1, bt,
+            xp, ty, zm, 2, tt, xp, by, zm, 2, bt, p.x, ty, zp, 3, tt, p.x, by, zp, 3, bt]));
+    }
+    /** perform's CUE_DRAW geometry, for the viewer: triangle strips of [x, y, z, s, t] vertices */
+    ropeStrips(): Float32Array[] {
+        const out: Float32Array[] = [];
+        if (!this.boards.length || !this.unk38.length) return out;
+        for (const b of this.boards) { HangingBridge.drawOneRope(b.ropes[0], out); HangingBridge.drawOneRope(b.ropes[1], out); }
+        this.drawRopeBetweenBoards(0, HangingBridge.mPointNumBetweenBoards, out);
+        this.drawRopeBetweenBoards(HangingBridge.mRopeHeight, 1, out);
+        return out;
+    }
+    initMonte() {
+        for (let i = 0; i < this.boards.length; i++) {
+            const p = MONTE_BOARDS[i];
+            if (p[0] === -1) break;
+            const b = this.boards[i];
+            b.initialPos.set(p[0], p[1], p[2]);
+            b.pos.set(b.initialPos);
+            b.rot.x = p[3];
+            b.calcDefaultMtx();
+        }
+    }
+    loadAfter() {
+        const map = this.world.map;
+        let rotY = 0, n = 0;
+        if (map === 13) {
+            n = 14; this.unk18.set(1550, 2980, -9410); this.unk24.set(3570, 2455, -9410);
+            HangingBridge.mRopeHeight = 200; rotY = 90; this.unk40 = fr(0.8); this.unk44 = 0.5; this.unk3C = 150;
+        } else if (map === 8) {
+            n = 19; this.unk18.set(0, 0, 11356); this.unk24.set(0, -750, 17743);
+            HangingBridge.mRopeHeight = 1000; this.unk40 = 1; this.unk44 = 0.5; this.unk3C = 315;
+        }
+        // (unk30: the bridge's direction across, for its ropes. THangingBridge::loadAfter,
+        // disassembled: TVec2<f32>::normalize -- squared length, zero within TUtil<f32>::epsilon
+        // (2^-18) else times inv_sqrt (frsqrte + one Newton step) -- then TVec2<f32>::rotate(pi/2)
+        // as a real cosf/sinf(1.5707963705062866) and a fused 2D rotation, not a hardcoded swap.)
+        let dx = fr(this.unk24.x - this.unk18.x), dz = fr(this.unk24.z - this.unk18.z);
+        const sq = fr(fr(dx * dx) + fr(dz * dz));
+        if (sq > fr(3.814697265625e-6)) { const k = jgInvSqrt(sq); dx = fr(dx * k); dz = fr(dz * k); }
+        else { dx = 0; dz = 0; }
+        const ang = 1.5707963705062866, cs = cosf(ang), sn = sinf(ang);
+        this.unk30 = [FMS(dx, cs, fr(dz * sn)), FMA(dx, sn, fr(dz * cs))];
+        for (let i = 0; i < n; i++) {
+            const t = fr(i / (n - 1));
+            const pos = new V3(fr(fr(t * fr(this.unk24.x - this.unk18.x)) + this.unk18.x),
+                fr(fr(fr(t * fr(this.unk24.y - this.unk18.y)) + this.unk18.y) - 0),
+                fr(fr(t * fr(this.unk24.z - this.unk18.z)) + this.unk18.z));
+            const b = newAndRegisterObj(this.world, map === 8 ? 'HangingBridgeBoard' : 'PinnaHangingBridgeBoard', pos, new V3(15, rotY, 0), new V3(1, 1, 1)) as HangingBridgeBoard | null;
+            if (!b) continue;
+            b.bridge = this;
+            b.appear();
+            this.boards.push(b);
+        }
+        if (map === 8) this.initMonte();
+        // (MapObjMonte.cpp: the rope ends after the boards are placed. US and later: Pianta Village's
+        // measured ends, less the rope height, and Ricco's far end 120 nearer; JP 1.0: round numbers.)
+        if (!V.GMSJ01) {
+            const h = HangingBridge.mRopeHeight;
+            if (map === 13) { this.unk18.set(fr(1436.32), fr(fr(3201.477) - h), fr(-9417.205)); this.unk24.set(fr(3656.32), fr(fr(2631.477) - h), fr(-9417.205)); }
+            else if (map === 8) this.unk24.z = fr(this.unk24.z - 120);
+        } else if (map === 13) { this.unk18.set(1350, 2980, -9410); this.unk24.set(3650, 2455, -9410); }
+        const B = this.boards;
+        for (let i = 0; i < B.length; i++) {
+            if (i > 0) B[i].prev = B[i - 1];
+            if (i > 1) B[i].prev2 = B[i - 2];
+            if (i < B.length - 1) B[i].next = B[i + 1];
+            if (i < B.length - 2) B[i].next2 = B[i + 2];
+        }
+        const N = HangingBridge.mPointNumBetweenBoards, step = fr(1 / N);
+        let angle = 0;
+        this.unk38 = [];
+        for (let i = 0; i < N; i++) { this.unk38.push(fr(50 * sinf(fr(fr(3.14) * angle)))); angle = fr(angle + step); }
+    }
+}
+
+// ---------------------------------------------------------------- TSwingBoard
+export class SwingBoard extends MapObjBase {
+    static mReturnAccelRate = fr(0.0001); static mSpeedDownRate = fr(0.998);
+    /** unk138: the rope length; unk13C its angle (degrees), unk144 its speed, unk148 the speed past which it slows; unk140 how much a spray pushes */
+    unk138 = 5000; unk13C = 0; unk140 = 0; unk144 = 0; unk148 = 0;
+    unk14C: Mtx = mtx(); unk17C = new V3();
+    static mBoardWidth = 315; static mRopeWidthX = 10; static mRopeWidthZ = 7; static mTexPosRate = fr(0.01);
+    constructor(w: World, name = 'ブランコ') { super(w, name); ((w as any).ropeDrawers ??= []).push(this); }
+    /** drawOneRope(top, bottom): a strip of 8 [x, y, z, s, t] */
+    private drawOneRope(a: V3, b: V3, out: Float32Array[]) {
+        const S = SwingBoard;
+        const xPB = fr(b.x + S.mRopeWidthX), xMB = fr(b.x - S.mRopeWidthX), zPB = fr(b.z + S.mRopeWidthZ), zMB = fr(b.z - S.mRopeWidthZ);
+        const xPA = fr(a.x + S.mRopeWidthX), xMA = fr(a.x - S.mRopeWidthX), zPA = fr(a.z + S.mRopeWidthZ), zMA = fr(a.z - S.mRopeWidthZ);
+        const t = fr(this.unk138 * S.mTexPosRate);
+        out.push(Float32Array.of(
+            a.x, a.y, zPA, 0, t, b.x, b.y, zPB, 0, 0,
+            xPA, a.y, zMA, 1, t, xPB, b.y, zMB, 1, 0,
+            xMA, a.y, zMA, 2, t, xMB, b.y, zMB, 2, 0,
+            a.x, a.y, zPA, 3, t, b.x, b.y, zPB, 3, 0));
+    }
+    /** initDraw + draw (perform's CUE_DRAW): its two ropes from the board's ends (getAnmMtx(0)'s x axis) up to the hanging point; textured with the bridge rope texture */
+    draw(out: Float32Array[]) {
+        const S = SwingBoard, m = this.rootMtx(), ip = this.initialPos, p = this.pos;
+        const ax = fr(S.mBoardWidth * m[0]), az = fr(S.mBoardWidth * m[8]);
+        const bottom = new V3(fr(ax + ip.x), fr(this.unk138 + ip.y), fr(az + ip.z));
+        const top = new V3(fr(ax + p.x), fr(60 + p.y), fr(az + p.z));
+        this.drawOneRope(top, bottom, out);
+        bottom.x = fr(ip.x - ax); bottom.z = fr(ip.z - az);
+        top.x = fr(p.x - ax); top.z = fr(p.z - az);
+        this.drawOneRope(top, bottom, out);
+    }
+    swing() {
+        const g = marioWaterGun(this.world);
+        if (this.marioIsOn() && g.emitting) {
+            const e = g.mtx, d = new V3(-e[0], 0, -e[8]);
+            const m = this.rootMtx();
+            // (JP 0x801CAAF4: (m6 * 0 + m2 * dx) + m10 * dz, then into the speed, each a fmadds)
+            this.unk144 = fmadd(this.unk140, fmadd(m[10], d.z, fmadd(m[2], d.x, fr(m[6] * d.y))), this.unk144);
+        }
+    }
+    control() {
+        super.control();
+        if (this.marioIsOn()) this.swing();
+        const S = SwingBoard;
+        this.unk13C = fr(this.unk13C + this.unk144);
+        const old = this.unk144;
+        this.unk144 = fnmsub(this.unk13C, S.mReturnAccelRate, this.unk144);   // (fnmsubs)
+        if (Math.abs(this.unk144) > this.unk148) this.unk144 = fr(this.unk144 * S.mSpeedDownRate);
+        if (fr(old * this.unk144) <= 0) this.world.sound(this.unk144 > 0 ? SE.OBJ_SWING1 : SE.OBJ_SWING2, this.pos);
+        this.rot.x = -this.unk13C;
+        const a = fr(PI_314 * fr(this.rot.x / 180)), sn = sinf(a), cs = cosf(a);
+        const r = mtx();
+        r[0] = 1; r[1] = 0; r[2] = 0; r[3] = 0;
+        r[4] = 0; r[5] = cs; r[6] = -sn; r[7] = 0;
+        r[8] = 0; r[9] = sn; r[10] = cs; r[11] = 0;
+        const m = mtx();
+        MTXConcat(this.unk14C, r, m);
+        // (JP 0x801CACF4: each a fnmsubs)
+        this.pos.x = fnmsub(m[1], this.unk138, this.initialPos.x);
+        this.pos.y = fnmsub(m[5], this.unk138, fr(this.unk138 + this.initialPos.y));
+        this.pos.z = fnmsub(m[9], this.unk138, this.initialPos.z);
+        // (the model's root matrix: its scale stays as getAnmMtx(0) had it)
+        m[3] = this.pos.x; m[7] = this.pos.y; m[11] = this.pos.z;
+        setRootMtx(this, m);
+    }
+    load(s: Stream) {
+        super.load(s);
+        this.unk138 = s.f32();
+        if (this.unk138 === -1) this.unk138 = 5000;
+        this.unk140 = s.f32();
+        if (this.unk140 > 10 || this.unk140 === 0) this.unk140 = fr(0.003);
+        this.unk17C.set(this.pos.x, fr(this.pos.y + this.unk138), this.pos.z);
+        this.unk148 = fr(fr(0.05) * fr(fr(1 + MsRandF()) / 2));
+        this.unk13C = fr(20 * fr(MsRandF() - 0.5));
+        if (this.unk13C > 0) this.unk144 = fr(this.unk148 * -MsRandF());
+        else this.unk144 = fr(this.unk148 * MsRandF());
+        MsMtxSetRotY(this.unk14C, this.rot.y);
+    }
+}
+
+// ---------------------------------------------------------------- TGoalFlag
+export class GoalFlag extends MapObjBase {
+    getRadiusAtY(_y: number) { return 20; }
+    touchActor(a: HitActor) {
+        if (a.isActorType(AT.MARIO)) {
+            // TFlagManager MSF_RACE_GOAL_REACHED
+            this.world.flags.setBool(true, MSF.RACE_GOAL_REACHED);
+            a.receiveMessage(this, MSG.ATTACK);
+        } else if (a.isActorType(AT.E_MARIO)) a.receiveMessage(this, MSG.ATTACK);
+    }
+}
+
+// ---------------------------------------------------------------- TFluff / TFluffManager
+/** gpMapObjManager->unkD0: the wind the big fluff starts */
+const WIND = new WeakMap<World, V3>();
+export const mapObjWind = (w: World) => { let v = WIND.get(w); if (!v) { v = new V3(); WIND.set(w, v); } return v; };
+
+export class Fluff extends MapObjBase {
+    getRadiusAtY(_y: number) { return 20; }
+    static mScaleUpSpeed = fr(0.05); static mScaleDownSpeed = fr(0.01);
+    unk138 = 0; unk13C = 0; unk140 = 0; unk144 = 0; unk148 = 0; unk14C = 0; unk150 = 0;
+    unk154 = 0; unk158 = 0; unk15C = 0; unk160 = 1; unk164 = fr(0.95);
+    mgr: FluffManager | null = null; unk16C = 0;
+    constructor(w: World, name = 'わた毛') { super(w, name); }
+    touchWater(a: HitActor) {
+        const p = getWaterPos(this.world, a);
+        // getNormalVecFromTarget (0x80191314): the delta, then MsVECNormalize (the raw frsqrte
+        // estimate, no Newton step, no zero guard) -- not a Math.sqrt-based normalize.
+        const n = V3.sub(this.pos, p);
+        vNormMs(n);
+        this.vel.x = fr(this.vel.x - fr(n.x * this.unk160));
+        this.vel.y = fr(this.vel.y - fr(n.y * this.unk160));
+        this.vel.z = fr(this.vel.z - fr(n.z * this.unk160));
+        return 1;
+    }
+    move() {
+        const W = mapObjWind(this.world);
+        this.pos.y = fr(this.pos.y - this.unk13C);
+        if (this.pos.y < 0) this.pos.y = 5000;
+        this.unk154 = fr(this.unk154 + fr(this.unk150 * W.x));
+        this.unk15C = fr(this.unk15C + fr(this.unk150 * W.z));
+        this.unk154 = fr(this.unk154 + this.vel.x);
+        this.unk158 = fr(this.unk158 + this.vel.y);
+        this.unk15C = fr(this.unk15C + this.vel.z);
+        this.vel.scale(this.unk164);
+        const wave = fr(this.unk138 * sinf(fr(fr(PI_314 * this.unk148) / 180)));
+        this.pos.x = fr(fr(this.initialPos.x + fr(wave * fr(this.unk144 + this.unk140))) + this.unk154);
+        this.pos.y = fr(this.pos.y + fr(this.unk150 * W.y));
+        this.pos.z = fr(fr(this.initialPos.z + fr(wave * fr(this.unk140 - this.unk144))) + this.unk15C);
+        if (W.x === 0 && W.y === 0 && W.z === 0) {
+            this.unk148 = fr(this.unk148 + this.unk14C);
+            if (this.unk148 > 360) this.unk148 = fr(this.unk148 - 360);
+        }
+        if (this.held && this.held.isActorType(AT.MARIO)) this.world.mario.pos.y = fr(this.world.mario.pos.y - this.unk13C);
+    }
+    kill() {
+        if (this.held) { this.held.receiveMessage(this, MSG.DETACH); this.held = null; }
+        this.state = STATE_UNK3;
+    }
+    control() {
+        super.control();
+        this.move();
+        switch (this.state) {
+            case STATE_UNK2: {
+                const v = Fluff.mScaleUpSpeed;
+                this.scale.set(fr(this.scale.x + v), fr(this.scale.y + v), fr(this.scale.z + v));
+                if (this.scale.x > 1) { this.scale.setAll(1); this.setObjHitData(0); this.state = STATE_NORMAL; }
+                break;
+            }
+            case STATE_NORMAL: {
+                const [h, d] = this.world.checkGround(this.pos.x, this.pos.y, this.pos.z);
+                this.groundHeight = h; this.groundPlane = d;
+                if (this.vel.y < 0 && (h > fr(this.pos.y - this.unk13C) || this.pos.y < -1000)) this.kill();
+                if (this.world.col.checkWalls({ center: [this.pos.x, this.pos.y, this.pos.z], radius: 100, maxResults: 1, flags: 0, results: [] }) !== 0) this.kill();
+                if (this.pos.x < -14848 || 14848 < this.pos.x || this.pos.z < -19968 || 19968 < this.pos.z) this.kill();
+                break;
+            }
+            case STATE_UNK3: {
+                const v = Fluff.mScaleDownSpeed;
+                this.scale.set(fr(this.scale.x - v), fr(this.scale.y - v), fr(this.scale.z - v));
+                if (this.scale.x < fr(0.1)) {
+                    this.emit('ms_enm_disap_a_w');
+                    this.world.sound(SE.SMOKE_EFFECT, this.pos);
+                    this.scale.setAll(fr(0.0001));
+                    this.stateTimer = 240;
+                    this.state = STATE_UNK4;
+                }
+                break;
+            }
+            case STATE_UNK4:
+                if (!this.isStateTimerEngaged()) {
+                    this.appear();
+                    this.rot.set(0, fr(360 * MsRandF()), 0);
+                    this.initialRot.set(this.rot);
+                    this.unk16C = 0;
+                    this.mgr!.registerNextFluff(this);
+                }
+                break;
+        }
+    }
+    appear() {
+        this.makeObjAppeared();
+        const M = this.mgr!;
+        // (the arguments are evaluated last first: z, then y, then x, as the DOL calls them)
+        const z = M.getRandomZ(), y = fr(M.pos.y * MsRandF()), x = M.getRandomX();
+        this.pos.set(x, y, z);
+        this.initialPos.set(this.pos);
+        this.scale.setAll(fr(0.0001));
+        this.unk15C = 0; this.unk158 = 0; this.unk154 = 0; this.unk148 = 0;
+        this.unk150 = fr(fr(0.8) * MsRandF() + fr(0.2));   // (fmadds)
+        this.unk140 = sinf(fr(fr(PI_314 * this.rot.y) / 180));
+        this.unk144 = cosf(fr(fr(PI_314 * this.rot.y) / 180));
+        this.unk148 = fr(360 * MsRandF());
+        this.unk14C = fr(0.3);
+        this.state = STATE_UNK2;
+    }
+    initMapObj() { super.initMapObj(); this.unk138 = 300; this.unk13C = 0.5; }
+}
+
+export class FluffManager extends MapObjBase {
+    static mWindMin = 1;
+    unk138 = 0; unk13C = 0; unk140 = 0; unk144 = 0; unk148 = new V3(); unk154 = 0;
+    /** unk158 the big fluff, unk15C the next one */
+    unk158: Fluff | null = null; unk15C: Fluff | null = null;
+    fluffs: Fluff[] = [];
+    constructor(w: World, name = 'わた毛管理') { super(w, name); }
+    findNextFluff() {
+        const m = this.world.mario.pos;
+        for (let i = 3; i < this.fluffs.length; i++) {
+            const f = this.fluffs[i];
+            if (f.unk16C === 0 && !f.held && Math.hypot(f.pos.x - m.x, f.pos.y - m.y, f.pos.z - m.z) > 3000) { this.unk15C = f; f.kill(); break; }
+        }
+    }
+    control() {
+        const W = mapObjWind(this.world), big = this.unk158!;
+        switch (this.state) {
+            case STATE_NORMAL:
+                if (!this.unk15C && fr(big.pos.y - 100) < fr(this.pos.y - this.unk140)) this.findNextFluff();
+                if (big.pos.y < fr(this.pos.y - this.unk140)) {
+                    this.world.sound(SE.OBJ_WATAGE_WIND, big.pos);
+                    this.stateTimer = this.unk144;
+                    this.state = STATE_UNK2;
+                }
+                break;
+            case STATE_UNK2:
+                W.set(fr(W.x + this.unk148.x), fr(W.y + this.unk148.y), fr(W.z + this.unk148.z));
+                if (!this.isStateTimerEngaged()) this.state = STATE_UNK3;
+                break;
+            case STATE_UNK3: {
+                const v = new V3(W.x, W.y, W.z).scale(this.unk154);
+                const n = FluffManager.mWindMin;
+                if (Math.abs(v.x) < n && Math.abs(v.y) < n && Math.abs(v.z) < n) { v.setAll(0); this.setUpNextFluff(); this.state = STATE_NORMAL; }
+                W.set(v);
+                break;
+            }
+        }
+    }
+    registerNextFluff(f: Fluff) { if (!this.unk15C) { this.unk15C = f; f.makeObjDead(); } }
+    setUpNextFluff() {
+        const f = this.unk15C!;
+        this.unk158 = f;
+        f.rot.set(this.rot); f.initialRot.set(this.rot);
+        f.appear();
+        f.pos.set(this.pos); f.initialPos.set(this.pos);
+        f.rot.setAll(0); f.initialRot.set(f.rot);
+        f.unk148 = 0; f.unk150 = 1; f.unk16C = 1;
+        this.unk15C = null;
+    }
+    newFluff(name: string) {
+        const f = new Fluff(this.world, name);
+        f.initAndRegister('Fluff');
+        f.mgr = this;
+        return f;
+    }
+    getRandomX() { return fr(this.unk138 * fr(fr(2 * MsRandF()) - 1)); }
+    getRandomZ() { return fr(this.unk13C * fr(fr(2 * MsRandF()) - 1)); }
+    loadAfter() {
+        const a = this.newFluff('１つ目のわた毛');
+        this.unk158 = a; a.unk16C = 1;
+        a.appear();
+        a.pos.set(this.pos); a.rot.set(this.rot);
+        { const z = this.getRandomZ(), y = fr(this.pos.y * MsRandF()), x = this.getRandomX(); a.initialPos.set(x, y, z); }
+        this.fluffs.push(a);
+        const b = this.newFluff('２つ目のわた毛');
+        this.unk15C = b;
+        b.pos.set(this.pos); b.rot.set(this.rot);
+        { const z = this.getRandomZ(), y = fr(this.pos.y * MsRandF()), x = this.getRandomX(); b.initialPos.set(x, y, z); }
+        b.makeObjDead();
+        this.fluffs.push(b);
+        for (let i = 2; i < 32; i++) { const f = this.newFluff('わた毛'); f.appear(); this.fluffs.push(f); }
+    }
+    load(s: Stream) {
+        super.load(s);
+        this.unk140 = s.f32();
+        const scale = fr(s.f32() * fr(0.01));
+        this.unk144 = s.s32();
+        this.unk138 = 5000; this.unk13C = 5000; this.unk154 = fr(0.998);
+        const m = mtx();
+        MsMtxSetXYZRPH(m, 0, 0, 0, this.rot.x, this.rot.y, this.rot.z);
+        // unk148 = m * (0, 0, 1), by the scale
+        this.unk148.set(fr(m[2] * scale), fr(m[6] * scale), fr(m[10] * scale));
+    }
+}
+
+// ---------------------------------------------------------------- MapObjHide.cpp: the breakable ones
+export class BreakHideObj extends HideObjBase {
+    constructor(w: World, name = '壊れる隠しオブジェ') { super(w, name); }
+    kill() {
+        this.startAnim(2);
+        this.removeMapCollision();
+        this.onHitFilter(HF.NO_COLLISION);
+        this.onLiveFlag(LF.UNK10 | LF.UNK8);
+        this.stateTimer = -1;
+        this.state = 2;
+    }
+    receiveMessage(_sender: HitActor, msg: number) {
+        if (msg === MSG.HIP_DROP) {
+            if (this.isActorType(AT.WATER_MELON_BLOCK)) {
+                this.emit('WaterMelonBlockA'); this.emit('WaterMelonBlockB');
+                this.world.sound(SE.OBJ_WATERMELON_BLOCK, this.pos);
+            }
+            this.kill();
+            return true;
+        }
+        return false;
+    }
+    control() {
+        MapObjBase.prototype.control.call(this);
+        if (this.state === 2 && this.animIsFinished()) { this.appearObj(0); this.makeObjDead(); }
+    }
+}
+export class WoodBox extends BreakHideObj {
+    constructor(w: World, name = '木箱') { super(w, name); }
+    killNearWoodBox(dx: number, dz: number) {
+        const m = this.world.mario.pos;
+        const [y, d] = this.world.checkGround(fr(dx + m.x), fr(m.y + 1000), fr(dz + m.z));
+        if (fr(y + 10) > m.y) {
+            const a = d && d.actor;
+            if (a && a !== this && a.isActorType(AT.WOOD_BOX)) (a as WoodBox).kill();
+        }
+    }
+    kill() {
+        super.kill();
+        this.world.sound(SE.IT_BARREL_CRASH, this.pos);
+        this.killNearWoodBox(-50, -50); this.killNearWoodBox(50, -50);
+        this.killNearWoodBox(-50, 50); this.killNearWoodBox(50, 50);
+    }
+    /** a box on a manhole (Delfino Plaza's) seals it */
+    loadAfter() { super.loadAfter(); this.checkOnManhole(); }
+}
+
+// ---------------------------------------------------------------- registry
+register('MonteRoot', (w, n) => new MapObjMonteRoot(w, n));
+register('JumpMushroom', (w, n) => new JumpMushroom(w, n));
+register('HangingBridge', (w, n) => new HangingBridge(w, n));
+register('SwingBoard', (w, n) => new SwingBoard(w, n));
+register('GoalFlag', (w, n) => new GoalFlag(w, n));
+register('FluffManager', (w, n) => new FluffManager(w, n));
+register('FruitTree', (w, n) => new MapObjBase(w, n));
+register('WatermelonBlock', (w, n) => new BreakHideObj(w, n));
+register('WoodBox', (w, n) => new WoodBox(w, n));
+export { STATE_UNK2, STATE_UNK3, mapObjGlobals };

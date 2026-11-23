@@ -1,0 +1,944 @@
+// Goop (Map/Pollution*.cpp): TPollutionManager's layers, each an I8 texture over a stretch of
+// the stage (TPollutionPos: texel size, a depth map of the ground under it), what's polluted
+// (isPolluted: above the layer's threshold, at the depth there), and the stamps that clean or
+// goop it. The game draws the stamps on the GPU once a frame (TPollutionCounterLayer::
+// countTexDegree, in the frame's draw lists) and copies the result back over the texture; here
+// the same TEV and blend maths run on the CPU over the same texel layout (GX I8 tiles).
+
+import { drawLayerGpu, gpuModelOf, stampFormatOk, type StampTex, type GpuModel } from './goopgpu.js';
+import { concat } from './j3dcalc.js';
+import { fmadd } from './player/fmath.js';
+import { V } from './version.js';
+import { MsRandF } from './math.js';
+import type { Files, MActor } from './engine.js';
+import type { Mtx } from './math.js';
+import { mat4 } from 'gl-matrix';
+import ArrayBufferSlice from '../../noclip/ArrayBufferSlice.js';
+import { BMD, DRW1MatrixKind } from '../../noclip/Common/JSYSTEM/J3D/J3DLoader.js';
+import { VertexAttributeInput } from '../../noclip/gx/gx_displaylist.js';
+import { GfxFormat, FormatTypeFlags, getFormatTypeFlags, getFormatComponentCount, getFormatFlags, FormatFlags } from '../../noclip/gfx/platform/GfxPlatformFormat.js';
+
+const fr = Math.fround;
+const s16 = (v: number) => (v << 16) >> 16;
+const clampI = (v: number, n: number) => (v < 0 ? 0 : v >= n ? n - 1 : v);
+
+export const POLLUTION_TYPE = { SINK: 0, FIRE: 1, SLIP: 2, GLASS_WALL: 3, ELECTRIC: 4, INSTAKILL: 5, SAFE: 6, UNK7: 7, UNK8: 8, UNK10: 10 };
+export const FLAG_CAN_SPREAD = 0x1, FLAG_DECAY = 0x2;
+/** TPollutionLayer::mAreaMinRate (.sdata 0x804092C8) */
+const TPollutionLayer_mAreaMinRate = fr(0.7);
+
+/** A GX texture's texels as intensity + alpha (I4, I8, IA4, IA8), row-major. */
+export interface Img { w: number; h: number; i: Uint8Array; a: Uint8Array; /** the image as the file has it, for the GPU (goopgpu.ts) */ raw?: StampTex; }
+export function decodeGX(fmt: number, w: number, h: number, d: Uint8Array, o: number): Img | null {
+    const I = new Uint8Array(w * h), A = new Uint8Array(w * h);
+    const blocks = (bw: number, bh: number, px: (x: number, y: number) => void) => {
+        for (let by = 0; by < h; by += bh) for (let bx = 0; bx < w; bx += bw)
+            for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) px(bx + x, by + y);
+    };
+    const put = (x: number, y: number, i: number, a: number) => { if (x < w && y < h) { I[y * w + x] = i; A[y * w + x] = a; } };
+    let k = o;
+    switch (fmt) {
+        case 0: { let n = 0; blocks(8, 8, (x, y) => { const b = d[k + (n >> 1)]; const v = (n & 1) ? b & 15 : b >> 4; n++; if ((n & 63) === 0) { k += 32; n = 0; } put(x, y, v * 17, v * 17); }); break; }
+        case 1: blocks(8, 4, (x, y) => { const v = d[k++]; put(x, y, v, v); }); break;
+        case 2: blocks(8, 4, (x, y) => { const b = d[k++]; put(x, y, (b & 15) * 17, (b >> 4) * 17); }); break;
+        case 3: blocks(4, 4, (x, y) => { const a = d[k++], i = d[k++]; put(x, y, i, a); }); break;
+        default: return null;
+    }
+    return { w, h, i: I, a: A };
+}
+export function parseBTI(b: Uint8Array): Img | null {
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const img = decodeGX(b[0], v.getUint16(2), v.getUint16(4), b, v.getUint32(0x1C));
+    // (ResTIMG: wrap S / T at 6 / 7, the filters at 0x14 / 0x15, the image at 0x1C)
+    if (img) img.raw = { fmt: b[0], w: img.w, h: img.h, data: b.subarray(v.getUint32(0x1C)), wrapS: b[6], wrapT: b[7], min: b[0x14], mag: b[0x15] };
+    return img;
+}
+
+/** A BMD's TEX1 texture 0: its format, size and data (TPollutionLayer::getTexResource). */
+function bmdTexture0(b: Uint8Array): { fmt: number; w: number; h: number; data: Uint8Array; off: number } | null {
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let o = 0x20;
+    while (o + 8 <= b.length) {
+        const tag = String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]), size = v.getUint32(o + 4);
+        if (tag === 'TEX1') {
+            const hdr = o + v.getUint32(o + 0x0C);
+            return { fmt: b[hdr], w: v.getUint16(hdr + 2), h: v.getUint16(hdr + 4), data: b, off: hdr + v.getUint32(hdr + 0x1C) };
+        }
+        if (!size) break;
+        o += size;
+    }
+    return null;
+}
+
+/** TPollutionPos */
+class Pos {
+    w = 0; h = 0; lw = 0; lh = 0; vofs = 0; texel = 0; inv = 0; depth!: Uint8Array;
+    constructor(public owner: Layer) { }
+    init(vofs: number, texel: number, depth: Uint8Array, lw: number, lh: number) {
+        this.depth = depth; this.vofs = vofs; this.texel = texel; this.inv = fr(1 / texel);
+        this.lw = lw; this.lh = lh; this.w = 1 << lw; this.h = 1 << lh;
+    }
+    index(x: number, z: number) { return (z & 3) * 8 + ((x >> 3) + ((z >> 2) << (this.lw - 3))) * 0x20 + (x & 7); }
+    inArea(x: number, z: number) { return !(x < 0 || this.w <= x || z < 0 || this.h <= z); }
+    getDepth(x: number, z: number) { return this.depth[this.index(x, z)]; }
+    /** setDepth (TPollutionObj::updateDepthMap) */
+    setDepth(x: number, z: number, d: number) { this.depth[this.index(x, z)] = d & 0xFF; }
+    worldToDepth(v: number) { return Math.trunc(fr(fr(v - this.vofs) * 0.025)); }
+    worldToTexSize(v: number) { return Math.trunc(fr(v * this.inv)); }
+    depthToWorld(v: number) { return fr(this.vofs + fr(v * this.texel)); }
+    getDepthWorld(x: number, z: number) { return this.getDepth(x, z) < 0xFF ? this.depthToWorld(this.getDepth(x, z)) : -9999; }
+    isProhibit(x: number, z: number) { return x < 0 || this.w <= x || z < 0 || this.h <= z ? true : this.getDepth(x, z) >= 0xFF; }
+    isSame(x: number, z: number, y: number) {
+        if (!this.inArea(x, z)) return false;
+        const d = this.getDepth(x, z);
+        if (d < 0xFF) { const i = this.worldToDepth(y), u = this.owner.unk48; return d - u <= i && i <= d + u; }
+        return false;
+    }
+    getEdgeDegree(x: number, y: number) {
+        if (!this.inArea(x, y)) return 0;
+        let n = 0;
+        for (let dy = -1; dy <= 1; ++dy) for (let dx = -1; dx <= 1; ++dx) if ((dx || dy) && this.depth[this.index(x + dx, y + dy)] === 0xFF) n++;
+        return n;
+    }
+}
+
+interface Task { x: number; z: number; size: number; y: number; }
+
+/** TPollutionLayer (plane types 0, 1: ground; 2-5 walls; 6 the sea's wave layer). */
+export class Layer {
+    type = 0; flags = 0; minX = 0; maxX = 0; minZ = 0; maxZ = 0; minY = 0; maxY = 0;
+    unk48 = 0; spreadTimer = 0; threshold = 0; changeDelta = 8; changeThreshold = 0;
+    /** mCounter: TPollutionCounterLayer::registerLayer sets it to -1 (u32) until the first count */
+    mCounter = 0xFFFFFFFF;
+    /** TPollutionCounterLayer::mIsLayerEnabled (onLayer / offLayer) */
+    counterOn = true;
+    effectTimer = 0; unkA8 = 0;
+    pos = new Pos(this);
+    /** mPollutionMap: the texture's texels (GX I8 tiles). */
+    map!: Uint8Array;
+    /** Changed since the viewer last took it. */
+    dirty = true;
+    /** The stamps waiting for the frame's draw (one queue per stamp type: TPollutionTexStamp). */
+    tasks: Task[][] = [[], []];
+    /** the frame's model stamps on this layer (mLayerModelStampTaskNum) */
+    modelTasks: ModelTask[] = [];
+    constructor(public mgr: Pollution, public index: number, public planeType: number, public name: string) { }
+
+    // the plane type's mapping (PollutionLayer.hpp)
+    texS(v: number) {
+        switch (this.planeType) {
+            case 2: return this.pos.worldToTexSize(this.maxZ - v);
+            case 3: return this.pos.worldToTexSize(v - this.minZ);
+            case 5: return this.pos.worldToTexSize(this.maxX - v);
+            default: return this.pos.worldToTexSize(v - this.minX);
+        }
+    }
+    texT(v: number) { return this.planeType >= 2 && this.planeType <= 5 ? this.pos.worldToTexSize(this.maxY - v) : this.pos.worldToTexSize(v - this.minZ); }
+    isInArea(x: number, y: number, z: number) {
+        if (this.planeType === 2 || this.planeType === 3) return !(z < this.minZ || this.maxZ < z || y < this.minY || this.maxY < y);
+        if (this.planeType === 4 || this.planeType === 5) return !(x < this.minX || this.maxX < x || y < this.minY || this.maxY < y);
+        return !(x < this.minX || this.maxX < x || z < this.minZ || this.maxZ < z);
+    }
+    isInAreaSize(x: number, y: number, z: number, s: number) {
+        if (this.planeType === 2 || this.planeType === 3) return !(z < this.minZ - s || this.maxZ + s < z || y < this.minY - s || this.maxY + s < y);
+        if (this.planeType === 4 || this.planeType === 5) return !(x < this.minX - s || this.maxX + s < x || y < this.minY - s || this.maxY + s < y);
+        return !(x < this.minX - s || this.maxX + s < x || z < this.minZ - s || this.maxZ + s < z);
+    }
+
+    initLayerInfo(type: number, flags: number, l: number, t: number, r: number, b: number) {
+        this.type = type; this.flags = flags; this.minX = l; this.minZ = t; this.maxX = r; this.maxZ = b; this.unk48 = 2;
+        if (type === POLLUTION_TYPE.UNK7) { this.threshold = 200; this.changeThreshold = 160; }
+        // (PollutionLayer.cpp #if !defined(VERSION_GMSJ01): US and later give electric goop fire's thresholds too)
+        else if (type === POLLUTION_TYPE.FIRE || (!V.GMSJ01 && type === POLLUTION_TYPE.ELECTRIC)) { this.threshold = 128; this.changeThreshold = 128; }
+        else { this.threshold = 30; this.changeThreshold = 50; }
+        if (this.planeType === 4 || this.planeType === 5) { this.minY = this.minZ; this.maxY = this.maxZ; this.unk48 = 20; }
+        if (this.planeType === 2 || this.planeType === 3) { this.minY = this.minZ; this.maxY = this.maxZ; this.minZ = this.minX; this.maxZ = this.maxX; this.unk48 = 20; }
+    }
+
+    /** initTexImage: the starting goop from the layer's .bmp (8-bit, bottom-up rows), edges softened. */
+    initTexImage(bmp: Uint8Array | null, mareEdge: boolean) {
+        const P = this.pos, w = P.w, h = P.h;
+        for (let y = 0; y < h; ++y) for (let x = 0; x < w; ++x) {
+            const d = bmp ? bmp[0x436 + x + w * (h - 1 - y)] : 0;
+            let v = 0;
+            if ((!mareEdge || (x > 0 && x < w - 1 && y > 0 && y < h - 1)) && d && !P.isProhibit(x, y)) {
+                const e = P.getEdgeDegree(x, y);
+                v = e ? (d - e * 50) & 0xFF : d;
+            }
+            this.map[P.index(x, y)] = v;
+        }
+    }
+
+    isPollutedST(s: number, t: number, y: number) { return this.pos.isSame(s, t, y) && this.map[this.pos.index(s, t)] > this.threshold; }
+    /** (Walls take the same path as the ground here, as the game's does.) */
+    isPolluted(x: number, y: number, z: number) {
+        if (!this.isInArea(x, y, z)) return false;
+        if (this.planeType === 6 && y > 1) return false;
+        // (TPollutionLayer::isPolluted: the virtual getTexPosS(x) / getTexPosT(z), whatever the plane)
+        return this.isPollutedST(this.texS(x), this.texT(z), y);
+    }
+
+    stamp(type: number, x: number, y: number, z: number, size: number) {
+        if (!this.isInAreaSize(x, y, z, size)) return;
+        const P = this.pos;
+        let s: number, t: number, d: number;
+        switch (this.planeType) {
+            case 2: case 3: s = this.texS(z); t = this.texT(y); d = P.worldToDepth(x); break;
+            case 4: case 5: s = this.texS(x); t = this.texT(y); d = P.worldToDepth(z); break;
+            default: s = this.texS(x); t = this.texT(z); d = P.worldToDepth(y); break;
+        }
+        this.mgr.pushStampTask(type, this, P.worldToTexSize(size), s, t, d);
+        // (walls' stamp doesn't count what it cleaned)
+        if (this.planeType <= 1 && this.mgr.stampIsCleanType(type)) this.cleaned(x, y, z, size);
+    }
+    cleaned(_x: number, _y: number, _z: number, _s: number) { /* effects and sounds: the counter's statics only */ }
+
+    // ---------------------------------------------------------------- PollutionAction.cpp
+    getPollutedPos(range: number, mario: { x: number, y: number, z: number }, out: { x: number, y: number, z: number }) {
+        for (let i = 0; i < 5; ++i) {
+            out.x = fr(range * fr(MsRandF() - 0.5) + mario.x);
+            out.y = mario.y;
+            out.z = fr(range * fr(MsRandF() - 0.5) + mario.z);
+            if (this.isPolluted(out.x, out.y, out.z)) return true;
+        }
+        return false;
+    }
+    getPollutedPosNear(range: number, mario: { x: number, y: number, z: number }, out: { x: number, y: number, z: number }) {
+        const P = this.pos;
+        for (let i = 0; i < 5; ++i) {
+            const a0 = MsRandF(), a1 = MsRandF();   // (the first roll is the area rate's, the second the direction's)
+            const a = fr(fr(a1 - 0.5) * fr(TPollutionLayer_mAreaMinRate + a0));
+            out.x = fr(a * range + mario.x);
+            const b0 = MsRandF(), b1 = MsRandF();   // (the first roll is the area rate's, the second the direction's)
+            const b = fr(fr(b1 - 0.5) * fr(TPollutionLayer_mAreaMinRate + b0));
+            out.z = fr(b * range + mario.z);
+            if (this.isInArea(out.x, 0, out.z)) {
+                const tx = this.texS(out.x), tz = this.texS(out.z);
+                if (P.inArea(tx, tz)) {
+                    out.y = P.getDepthWorld(tx, tz);
+                    if (out.y > mario.y) return false;
+                    if (this.map[P.index(tx, tz)] !== 0) return true;
+                }
+            }
+        }
+        return false;
+    }
+    /** TPollutionLayer::action, every movement tick (on the graffiti group's CUE_MOVE). */
+    action(mario: { x: number, y: number, z: number }) {
+        if (this.planeType !== 0) return;
+        const tmp = { x: 0, y: 0, z: 0 };
+        switch (this.type) {
+            case POLLUTION_TYPE.FIRE: if (this.getPollutedPosNear(1600, mario, tmp)) { if (++this.effectTimer > 20) this.effectTimer = 0; } break;
+            case POLLUTION_TYPE.ELECTRIC: if (this.getPollutedPosNear(1000, mario, tmp)) { if (++this.effectTimer > 15) this.effectTimer = 0; } break;
+            case POLLUTION_TYPE.GLASS_WALL: this.getPollutedPos(1000, mario, tmp); break;
+        }
+        if (this.getPollutedPos(2000, mario, tmp)) {
+            if (this.type !== POLLUTION_TYPE.FIRE && this.type !== POLLUTION_TYPE.UNK7) {
+                if (this.effectTimer > 15) this.effectTimer = 0;
+                this.effectTimer += 1;
+            }
+            if (this.flags & FLAG_CAN_SPREAD) {
+                if (this.spreadTimer < 3) this.spreadTimer += 1;
+                else { this.spreadTimer = 0; const sp = { x: 0, y: 0, z: 0 }; if (this.getPollutedPosNear(2000, mario, sp)) this.mgr.stamp(1, sp.x, sp.y, sp.z, 128); }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- the frame's GPU pass
+    /** drawPollutionLayer: residue under the threshold fades by the step (UNK7: above it grows; decaying: all fades). */
+    private fade() {
+        // (returns the texels left above 0: the pass's count)
+        const M = this.map, n = M.length;
+        let z = 0;
+        if (this.type === POLLUTION_TYPE.UNK7) {
+            const th = this.changeThreshold, st = (this.flags & FLAG_DECAY) ? 2 : this.changeDelta;
+            for (let k = 0; k < n; k++) { const c = M[k]; if (th > c) { if (c) z++; continue; } const v = c + st; M[k] = v > 255 ? 255 : v; z++; }
+        } else if (this.flags & FLAG_DECAY) {
+            for (let k = 0; k < n; k++) { const v = M[k] - 2; if (v > 0) { M[k] = v; z++; } else M[k] = 0; }
+        } else {
+            const th = this.changeThreshold, st = this.changeDelta;
+            for (let k = 0; k < n; k++) { const c = M[k]; if (th > c) { const v = c - st; if (v > 0) { M[k] = v; z++; } else M[k] = 0; } else z++; }
+        }
+        return z;
+    }
+    /** drawTexStamp / doTask: each stamp a quad of its shape, where the depth map is within unk48 of the stamp's. */
+    private stamps() {
+        const P = this.pos, M = this.map;
+        // through the GPU's own arithmetic when every stamp in use has its image as the file holds it
+        const S = this.tasks.map((tasks, type) => ({ tasks, img: this.mgr.stampTex[type], clean: this.mgr.stampKind(type) === 0 })).filter((q) => q.tasks.length && q.img);
+        const models = this.modelTasks;
+        if (!S.length && !models.length) return;
+        if (S.every((q) => q.img!.raw && stampFormatOk(q.img!.raw.fmt)) && models.every((t) => t.m.gpu)) {
+            // the view (makeWorldToPollutionMtx) times each draw matrix, as viewCalc concatenates them
+            const s = P.inv, V = [s, 0, 0, fr(-this.minX * s), 0, 0, s, fr(-this.minZ * s), 0, 0, 0, 0];
+            const md = models.map((t) => ({ gm: t.m.gpu!, draw: t.rows.map((r) => concat(V, r, new Array(12))) }));
+            drawLayerGpu(M, P.lw, P.lh, (x, z) => P.index(x, z), P.depth, this.unk48, md, S.map((q) => ({ tex: q.img!.raw!, clean: q.clean, tasks: q.tasks })),
+                { step: (this.flags & FLAG_DECAY) ? 2 : this.changeDelta, threshold: this.changeThreshold });
+            this.gpuDone = true;
+            return;
+        }
+        for (const t of models) drawModelStamp(this, t);
+        for (let type = 0; type < this.tasks.length; type++) {
+            const list = this.tasks[type], img = this.mgr.stampTex[type];
+            if (!img || !list.length) continue;
+            for (const t of list) {
+                // (u8) of the clamped depth window: the TEV's A0 / A1
+                const lo = Math.max(0, t.y - this.unk48) & 0xFF, hi = Math.min(255, t.y + this.unk48) & 0xFF;
+                // the quad's corners as s16 (the task's u16 x / z less or plus size / 2): a stamp centred
+                // just off the layer's low edge (its u16 texel wrapped) still reaches the edge texels
+                const half = t.size >> 1, x1 = s16(t.x - half), z1 = s16(t.z - half), x2 = s16(t.x + half), z2 = s16(t.z + half);
+                if (x2 <= x1 || z2 <= z1) continue;
+                const W = img.w, H = img.h, cleanType = this.mgr.stampKind(type) === 0;
+                for (let z = Math.max(0, z1); z < Math.min(P.h, z2); z++) {
+                    // the stamp shape (TEX0: 0..1 over the quad) at the pixel centre, GX_LINEAR / CLAMP
+                    // (the stamp BTIs' filter) in the 7-bit fixed point of Dolphin's TextureSampler
+                    const T = Math.trunc(((z + 0.5 - z1) / (z2 - z1)) * H * 128) - 64;
+                    const ft = T & 0x7F, t0 = clampI(T >> 7, H), t1 = clampI((T >> 7) + 1, H);
+                    for (let x = Math.max(0, x1); x < Math.min(P.w, x2); x++) {
+                        const k = P.index(x, z), hgt = P.depth[k];
+                        if (!(hgt > lo && hi > hgt)) continue;
+                        const S = Math.trunc(((x + 0.5 - x1) / (x2 - x1)) * W * 128) - 64;
+                        const fs = S & 0x7F, s0 = clampI(S >> 7, W), s1 = clampI((S >> 7) + 1, W);
+                        const w00 = (128 - fs) * (128 - ft), w10 = fs * (128 - ft), w01 = (128 - fs) * ft, w11 = fs * ft;
+                        const i00 = t0 * W + s0, i10 = t0 * W + s1, i01 = t1 * W + s0, i11 = t1 * W + s1;
+                        const a = (img.a[i00] * w00 + img.a[i10] * w10 + img.a[i01] * w01 + img.a[i11] * w11) >> 14;
+                        if (!a) continue;
+                        const c = cleanType ? (img.i[i00] * w00 + img.i[i10] * w10 + img.i[i01] * w01 + img.i[i11] * w11) >> 14 : 255;
+                        // GX_BL_SRCALPHA / INVSRCALPHA in 8 bits
+                        M[k] = (c * a + M[k] * (255 - a) + 127) / 255 | 0;
+                    }
+                }
+            }
+        }
+    }
+    /**
+     * TPollutionCounterLayer::countTexDegree (the layer's pass, once a frame in the draw lists). Off
+     * (offLayer): nothing's drawn, and the pass's EFB copy (TEfbCtrlTex, clearing what it copies to
+     * black) puts back a black texture: see countPixels.
+     */
+    private gpuDone = false;
+    countTexDegree() {
+        if (!this.counterOn) { this.map.fill(0); this.dirty = true; return; }
+        // drawPollutionLayer: the faded texture, drawn 1:1 into the EFB, counted (GXReadPixMetric's
+        // clr_pixels_in: the pixels past the alpha test GREATER 0, i.e. the texels the fade leaves
+        // above 0) before the frame's stamps go on
+        this.mCounter = pixMetric(this.fade(), 2);
+        this.gpuDone = false;
+        this.stamps();
+        if (this.modelTasks.length) this.cleanProhibitArea();
+        this.dirty = true;
+    }
+    /** cleanProhibitArea: after model stamps, texels whose height map is over 200 (no ground) go clean. */
+    cleanProhibitArea() { const d = this.pos.depth, M = this.map; for (let k = 0; k < M.length; k++) if (d[k] > 200) M[k] = 0; }
+    /** TPollutionLayer::getPollutionDegree: the counter (the last pass's GPU count; -1 before the first). */
+    degree() { return this.mCounter; }
+}
+
+// ---------------------------------------------------------------- model stamps
+// TPollutionManager::stampModel -> TPollutionLayer::stampModel (ground layers whose box holds the
+// model's base translation) -> TPollutionCounterLayer::pushModelStampTask (20 a frame). calcViewMtx
+// draws each such model, posed as it was entered, with view matrix makeWorldToPollutionMtx (texel
+// x = (x - minX) / texel, texel row = (z - minZ) / texel, depth 0) into the layer's pass, after
+// the fade (drawPollutionLayer) and before the joint-object / texture / revival stamps, with the
+// model's own materials (TEV, blend, alpha test, culling) over the layer's texels; a layer that
+// had any then has its prohibited texels (height map > 200) cleared (cleanProhibitArea).
+
+/** One vertex group of a shape: its vertices and the draw matrices its PNMTXIDX slots load. */
+interface SGroup { pos: Float32Array; slot: Uint8Array; clr: Float32Array | null; uv: Float32Array | null; idx: Uint32Array; mtxTable: Uint16Array; }
+interface SStage {
+    c: number[]; cop: number; cbias: number; cscale: number; cclamp: boolean; creg: number;
+    a: number[]; aop: number; abias: number; ascale: number; aclamp: boolean; areg: number;
+    kc: number; ka: number; tex: boolean;
+}
+interface SMat {
+    cull: number; stages: SStage[]; konst: number[][]; regs: number[][];
+    chan: { csrc: number; asrc: number; light: boolean; mat: number[]; amb: number[]; asrcAmb: number; csrcAmb: number };
+    tex: Img | null; wrapS: number; wrapT: number; texMtx: mat4 | null; texSrc: number;
+    blend: { mode: number; src: number; dst: number }; atest: { ca: number; ra: number; op: number; cb: number; rb: number }; colorUpdate: boolean;
+}
+interface SModel { gpu: GpuModel | null; shapes: { mat: number; groups: SGroup[] }[]; mats: SMat[]; drw: { kind: number; joint: number; env: number }[]; env: { j: number; w: number }[][]; invBind: mat4[]; }
+interface ModelTask { m: SModel; draw: mat4[]; /** the draw matrices as the game's J3DModel has them (rows, 12 words) */ rows: number[][]; }
+
+const modelCache = new WeakMap<Uint8Array, SModel | null>();
+const col = (c: { r: number; g: number; b: number; a: number }) => [c.r, c.g, c.b, c.a].map((v) => Math.max(0, Math.min(255, Math.round(v * 255))));
+function readAttr(layout: any, buffers: ArrayBufferLike[], input: number, n: number, comps: number): Float32Array | null {
+    const L = layout.singleVertexInputLayouts.find((l: any) => l.attrInput === input);
+    if (!L) return null;
+    const stride = layout.vertexBufferStrides[L.bufferIndex], dv = new DataView(buffers[L.bufferIndex] as ArrayBuffer);
+    const fmt: GfxFormat = L.format, type = getFormatTypeFlags(fmt), cc = getFormatComponentCount(fmt), norm = (getFormatFlags(fmt) & FormatFlags.Normalized) !== 0;
+    const out = new Float32Array(n * comps);
+    for (let i = 0; i < n; i++) for (let k = 0; k < comps && k < cc; k++) {
+        const o = i * stride + L.bufferOffset;
+        let v: number;
+        if (type === FormatTypeFlags.F32) v = dv.getFloat32(o + k * 4, true);
+        else if (type === FormatTypeFlags.U8) { v = dv.getUint8(o + k); if (norm) v /= 255; }
+        else if (type === FormatTypeFlags.S8) { v = dv.getInt8(o + k); if (norm) v /= 127; }
+        else if (type === FormatTypeFlags.U16) { v = dv.getUint16(o + k * 2, true); if (norm) v /= 65535; }
+        else if (type === FormatTypeFlags.S16) { v = dv.getInt16(o + k * 2, true); if (norm) v /= 32767; }
+        else v = 0;
+        out[i * comps + k] = v;
+    }
+    return out;
+}
+function loadStampModel(b: Uint8Array): SModel | null {
+    if (modelCache.has(b)) return modelCache.get(b)!;
+    let r: SModel | null = null;
+    try {
+        const bmd = BMD.parse(new ArrayBufferSlice(b.buffer as ArrayBuffer, b.byteOffset, b.byteLength));
+        const mats: SMat[] = bmd.mat3.materialEntries.map((m) => {
+            const g = m.gxMaterial;
+            const lc = g.lightChannels[0];
+            let tex: Img | null = null, wrapS = 0, wrapT = 0;
+            const ti = m.textureIndexes[0];
+            if (ti !== undefined && ti >= 0 && bmd.tex1.samplers[ti]) {
+                const smp = bmd.tex1.samplers[ti], td = bmd.tex1.textureDatas[smp.textureDataIndex];
+                if (td && td.data) tex = decodeGX(td.format, td.width, td.height, td.data.createTypedArray(Uint8Array), 0);
+                wrapS = smp.wrapS; wrapT = smp.wrapT;
+            }
+            const tg = g.texGens[0];
+            const tm = tg && tg.matrix !== 60 ? m.texMatrices[(tg.matrix - 30) / 3] : null;
+            return {
+                cull: g.cullMode,
+                stages: g.tevStages.map((t) => ({
+                    c: [t.colorInA, t.colorInB, t.colorInC, t.colorInD], cop: t.colorOp, cbias: t.colorBias, cscale: t.colorScale, cclamp: t.colorClamp, creg: t.colorRegId,
+                    a: [t.alphaInA, t.alphaInB, t.alphaInC, t.alphaInD], aop: t.alphaOp, abias: t.alphaBias, ascale: t.alphaScale, aclamp: t.alphaClamp, areg: t.alphaRegId,
+                    kc: t.konstColorSel, ka: t.konstAlphaSel, tex: t.texMap !== 255,
+                })),
+                konst: m.colorConstants.map(col), regs: m.colorRegisters.map(col),
+                chan: lc ? { csrc: lc.colorChannel.matColorSource, asrc: lc.alphaChannel.matColorSource, light: lc.colorChannel.lightingEnabled,
+                    csrcAmb: lc.colorChannel.ambColorSource, asrcAmb: lc.alphaChannel.ambColorSource,
+                    mat: col(m.colorMatRegs[0]), amb: col(m.colorAmbRegs[0]) }
+                    : { csrc: 0, asrc: 0, light: false, csrcAmb: 0, asrcAmb: 0, mat: [255, 255, 255, 255], amb: [0, 0, 0, 0] },
+                tex, wrapS, wrapT, texMtx: tm ? tm.matrix : null, texSrc: tg ? tg.source : 4,
+                blend: { mode: g.ropInfo.blendMode, src: g.ropInfo.blendSrcFactor, dst: g.ropInfo.blendDstFactor },
+                atest: { ca: g.alphaTest.compareA, ra: g.alphaTest.referenceA, op: g.alphaTest.op, cb: g.alphaTest.compareB, rb: g.alphaTest.referenceB },
+                colorUpdate: g.ropInfo.colorUpdate,
+            } as SMat;
+        });
+        const shapes = bmd.shp1.shapes.map((sh) => ({
+            mat: sh.materialIndex,
+            groups: sh.mtxGroups.map((mg) => {
+                const lvd = mg.loadedVertexData, n = lvd.totalVertexCount, lay = sh.loadedVertexLayout;
+                const p4 = readAttr(lay, lvd.vertexBuffers, VertexAttributeInput.POS, n, 4)!;
+                const pos = new Float32Array(n * 3), slot = new Uint8Array(n);
+                for (let i = 0; i < n; i++) { pos[i * 3] = p4[i * 4]; pos[i * 3 + 1] = p4[i * 4 + 1]; pos[i * 3 + 2] = p4[i * 4 + 2]; slot[i] = Math.round(p4[i * 4 + 3]); }
+                const ib = lay.indexFormat === GfxFormat.U32_R ? new Uint32Array(lvd.indexData as ArrayBuffer) : new Uint16Array(lvd.indexData as ArrayBuffer);
+                const idx = new Uint32Array(lvd.totalIndexCount);
+                // (the indices count from the shape's first vertex; vertexId is the next group's first)
+                const base = lvd.vertexId - n;
+                for (let i = 0; i < idx.length; i++) idx[i] = ib[i] - base;
+                return { pos, slot, clr: readAttr(lay, lvd.vertexBuffers, VertexAttributeInput.CLR0, n, 4), uv: readAttr(lay, lvd.vertexBuffers, VertexAttributeInput.TEX01, n, 2), idx, mtxTable: mg.useMtxTable } as SGroup;
+            }),
+        }));
+        let gpu: GpuModel | null = null;
+        try { gpu = gpuModelOf(b, bmd); } catch (e) { console.warn('[game] stamp model (GPU)', e); }
+        r = {
+            gpu, shapes, mats,
+            drw: bmd.drw1.matrixDefinitions.map((d: any) => ({ kind: d.kind, joint: d.jointIndex ?? -1, env: d.envelopeIndex ?? -1 })),
+            env: bmd.evp1.envelopes.map((e: any) => e.weightedBones.map((w: any) => ({ j: w.jointIndex, w: w.weight }))),
+            invBind: bmd.evp1.inverseBinds,
+        };
+    } catch (e) { console.warn('[game] stamp model', e); r = null; }
+    modelCache.set(b, r);
+    return r;
+}
+
+// TEV maths in 8 bits (GX: d + lerp(a, b, c), bias, scale, clamp; the compare ops)
+const clamp8 = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : v);
+const KSEL_FRAC = [255, 223, 191, 159, 128, 96, 64, 32];
+function tevLerp(a: number, b: number, c: number) { const cc = c + (c >> 7); return (a * (256 - cc) + b * cc) >> 8; }
+function tevOut(a: number, b: number, c: number, d: number, op: number, bias: number, scale: number, clampOn: boolean, cmpA = a, cmpB = b) {
+    if (op >= 8) {
+        // the compare ops: d + ((a OP b) ? c : 0) (R8 / RGB8 per channel; the 16/24-bit ones as R8)
+        const gt = (op & 1) === 0;
+        return clamp8(d + ((gt ? cmpA > cmpB : cmpA === cmpB) ? c : 0));
+    }
+    let v = tevLerp(a, b, c);
+    v = op === 1 ? d - v : d + v;
+    v += bias === 1 ? 128 : bias === 2 ? -128 : 0;
+    v = scale === 1 ? v * 2 : scale === 2 ? v * 4 : scale === 3 ? v >> 1 : v;
+    return clampOn ? clamp8(v) : Math.max(-1024, Math.min(1023, v));
+}
+function alphaCmp(f: number, v: number, ref: number) {
+    switch (f) { case 0: return false; case 1: return v < ref; case 2: return v === ref; case 3: return v <= ref; case 4: return v > ref; case 5: return v !== ref; case 6: return v >= ref; default: return true; }
+}
+function blendFactor(f: number, isDst: boolean, sa: number, sc: number, dc: number) {
+    switch (f) {
+        case 0: return 0; case 1: return 255;
+        case 2: return isDst ? sc : dc; case 3: return 255 - (isDst ? sc : dc);
+        case 4: return sa; case 5: return 255 - sa;
+        case 6: return 255; case 7: return 0;   // (the pass has no destination alpha)
+        default: return 255;
+    }
+}
+function sampleTex(img: Img, s: number, t: number, wrapS: number, wrapT: number): [number, number] {
+    // bilinear, with the sampler's wrap (0 clamp, 1 repeat, 2 mirror)
+    const wrap = (v: number, n: number, m: number) => {
+        if (m === 1) return ((v % n) + n) % n;
+        if (m === 2) { const p = ((v % (2 * n)) + 2 * n) % (2 * n); return p < n ? p : 2 * n - 1 - p; }
+        return v < 0 ? 0 : v >= n ? n - 1 : v;
+    };
+    const x = s * img.w - 0.5, y = t * img.h - 0.5, x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+    let I = 0, A = 0;
+    for (let k = 0; k < 4; k++) {
+        const xx = wrap(x0 + (k & 1), img.w, wrapS), yy = wrap(y0 + (k >> 1), img.h, wrapT);
+        const w = ((k & 1) ? fx : 1 - fx) * ((k >> 1) ? fy : 1 - fy);
+        I += img.i[yy * img.w + xx] * w; A += img.a[yy * img.w + xx] * w;
+    }
+    return [Math.round(I), Math.round(A)];
+}
+
+/**
+ * The draw matrices as J3DModel has them (rows, 12 words): a joint's matrix, or an envelope's
+ * (calcWeightEnvelopeMtx: each joint's matrix times its inverse bind, weighted and summed in its
+ * paired-single order: per row, columns 0-1 and 2-3 as pairs, every multiply-add fused).
+ */
+function drawRows(m: SModel, joints: mat4[]): number[][] {
+    const rows = (j: mat4) => [j[0], j[4], j[8], j[12], j[1], j[5], j[9], j[13], j[2], j[6], j[10], j[14]];
+    return m.drw.map((d) => {
+        if (d.kind === DRW1MatrixKind.Joint) return rows(joints[d.joint] || mat4.create());
+        const out = new Array(12).fill(0);
+        for (const w of m.env[d.env] || []) {
+            const W = rows(joints[w.j] || mat4.create()), I = rows(m.invBind[w.j]), wt = fr(w.w);
+            for (let r = 0; r < 3; r++) {
+                const a0 = W[r * 4], a1 = W[r * 4 + 1], a2 = W[r * 4 + 2], a3 = W[r * 4 + 3];
+                for (let c = 0; c < 4; c++) {
+                    // W x I: (I0c a0 + I1c a1) + I2c a2, and for the last column + 1 x a3 (column 2: + 0 x a2)
+                    let v = fmadd(I[8 + c], a2, fmadd(I[4 + c], a1, fr(I[c] * a0)));
+                    if (c === 3) v = fmadd(1, a3, v); else if (c === 2) v = fmadd(0, a2, v);
+                    out[r * 4 + c] = fmadd(v, wt, out[r * 4 + c]);
+                }
+            }
+        }
+        return out;
+    });
+}
+/** The model's draw matrices (DRW1): a joint's matrix, or an envelope's weighted joints x inverse binds. */
+function drawMatrices(m: SModel, joints: mat4[]): mat4[] {
+    const tmp = mat4.create();
+    return m.drw.map((d) => {
+        if (d.kind === DRW1MatrixKind.Joint) return joints[d.joint] || mat4.create();
+        const out = new Float32Array(16) as unknown as mat4;
+        for (const w of m.env[d.env] || []) { mat4.mul(tmp, joints[w.j], m.invBind[w.j]); mat4.multiplyScalarAndAdd(out, out, tmp, w.w); }
+        return out;
+    });
+}
+/** The model drawn into one layer's texels: its triangles rasterised at texel centres, each pixel through its material. */
+function drawModelStamp(L: Layer, task: ModelTask) {
+    const P = L.pos, M = L.map, inv = P.inv, minX = L.minX, minZ = L.minZ;
+    const { m, draw } = task;
+    const slots: mat4[] = [];
+    for (const sh of m.shapes) {
+        const mat = m.mats[sh.mat];
+        if (!mat || !mat.colorUpdate) continue;
+        for (const g of sh.groups) {
+            for (let i = 0; i < g.mtxTable.length; i++) if (g.mtxTable[i] !== 0xFFFF) slots[i] = draw[g.mtxTable[i]];
+            const n = g.pos.length / 3, X = new Float32Array(n), Y = new Float32Array(n), WX = new Float32Array(n), WZ = new Float32Array(n);
+            for (let i = 0; i < n; i++) {
+                const d = slots[g.slot[i]] || slots[0];
+                if (!d) continue;
+                const px = g.pos[i * 3], py = g.pos[i * 3 + 1], pz = g.pos[i * 3 + 2];
+                // (the view matrix drops world y: depth 0)
+                const wx = d[0] * px + d[4] * py + d[8] * pz + d[12], wz = d[2] * px + d[6] * py + d[10] * pz + d[14];
+                WX[i] = wx; WZ[i] = wz;
+                X[i] = (wx - minX) * inv; Y[i] = (wz - minZ) * inv;
+            }
+            for (let t = 0; t + 2 < g.idx.length; t += 3) {
+                const i0 = g.idx[t], i1 = g.idx[t + 1], i2 = g.idx[t + 2];
+                // culling as seen from above (the pass looks down the world's y axis, x right and z down the
+                // texture's rows): GX's front faces wind clockwise on screen, so their normal (right-handed)
+                // points down
+                const ny = (WZ[i1] - WZ[i0]) * (WX[i2] - WX[i0]) - (WX[i1] - WX[i0]) * (WZ[i2] - WZ[i0]);
+                if (mat.cull === 3 || (mat.cull === 2 && ny > 0) || (mat.cull === 1 && ny < 0)) continue;
+                rasterTri(L, mat, g, i0, i1, i2, X, Y, P.w, P.h, M);
+            }
+        }
+    }
+}
+function rasterTri(L: Layer, mat: SMat, g: SGroup, i0: number, i1: number, i2: number, X: Float32Array, Y: Float32Array, W: number, H: number, M: Uint8Array) {
+    const x0 = X[i0], y0 = Y[i0], x1 = X[i1], y1 = Y[i1], x2 = X[i2], y2 = Y[i2];
+    const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area === 0 || !isFinite(area)) return;
+    const minx = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxx = Math.min(W - 1, Math.ceil(Math.max(x0, x1, x2)));
+    const miny = Math.max(0, Math.floor(Math.min(y0, y1, y2))), maxy = Math.min(H - 1, Math.ceil(Math.max(y0, y1, y2)));
+    const P = L.pos;
+    for (let y = miny; y <= maxy; y++) for (let x = minx; x <= maxx; x++) {
+        const px = x + 0.5, py = y + 0.5;
+        let b0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) / area;
+        let b1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) / area;
+        let b2 = 1 - b0 - b1;
+        if (b0 < 0 || b1 < 0 || b2 < 0) continue;
+        const k = P.index(x, y);
+        M[k] = shadePixel(mat, g, i0, i1, i2, b0, b1, b2, M[k]);
+    }
+}
+function shadePixel(mat: SMat, g: SGroup, i0: number, i1: number, i2: number, b0: number, b1: number, b2: number, dst: number): number {
+    // the rasterised channel: material / ambient colour from the register or the vertex colour
+    const vc = (c: number) => g.clr ? clamp8(Math.round((g.clr[i0 * 4 + c] * b0 + g.clr[i1 * 4 + c] * b1 + g.clr[i2 * 4 + c] * b2) * 255)) : 255;
+    const ch = mat.chan;
+    const mc = [0, 1, 2].map((c) => (ch.csrc === 1 ? vc(c) : ch.mat[c]));
+    let ma = ch.asrc === 1 ? vc(3) : ch.mat[3];
+    let ras = mc;
+    if (ch.light) {
+        // (no lights in the pass: material x ambient)
+        const ac = [0, 1, 2].map((c) => (ch.csrcAmb === 1 ? vc(c) : ch.amb[c]));
+        ras = mc.map((v, c) => (v * clamp8(ac[c])) / 255 | 0);
+    }
+    const rasA = ma;
+    // the texture
+    let tc = [255, 255, 255], ta = 255;
+    if (mat.tex && g.uv) {
+        let s = g.uv[i0 * 2] * b0 + g.uv[i1 * 2] * b1 + g.uv[i2 * 2] * b2, t = g.uv[i0 * 2 + 1] * b0 + g.uv[i1 * 2 + 1] * b1 + g.uv[i2 * 2 + 1] * b2;
+        if (mat.texMtx) { const T = mat.texMtx; const s2 = T[0] * s + T[4] * t + T[12], t2 = T[1] * s + T[5] * t + T[13]; s = s2; t = t2; }
+        const [I, A] = sampleTex(mat.tex, s, t, mat.wrapS, mat.wrapT);
+        tc = [I, I, I]; ta = A;
+    }
+    // the TEV stages
+    const reg = mat.regs.map((r) => r.slice());   // [C0, C1, C2, PREV]
+    const prev = () => reg[3];
+    for (const st of mat.stages) {
+        const kc = st.kc <= 7 ? [KSEL_FRAC[st.kc], KSEL_FRAC[st.kc], KSEL_FRAC[st.kc]]
+            : st.kc >= 0x0C && st.kc <= 0x0F ? mat.konst[st.kc - 0x0C].slice(0, 3)
+            : st.kc >= 0x10 ? (() => { const kk = mat.konst[(st.kc - 0x10) & 3][((st.kc - 0x10) >> 2)]; return [kk, kk, kk]; })() : [255, 255, 255];
+        const ka = st.ka <= 7 ? KSEL_FRAC[st.ka] : st.ka >= 0x10 ? mat.konst[(st.ka - 0x10) & 3][(st.ka - 0x10) >> 2] : 255;
+        const T = st.tex ? tc : [255, 255, 255], TA = st.tex ? ta : 255;
+        const cin = (sel: number, c: number) => {
+            switch (sel) {
+                case 0: return prev()[c]; case 1: return prev()[3]; case 2: return reg[0][c]; case 3: return reg[0][3];
+                case 4: return reg[1][c]; case 5: return reg[1][3]; case 6: return reg[2][c]; case 7: return reg[2][3];
+                case 8: return T[c]; case 9: return TA; case 10: return ras[c]; case 11: return rasA;
+                case 12: return 255; case 13: return 128; case 14: return kc[c]; default: return 0;
+            }
+        };
+        const ain = (sel: number) => {
+            switch (sel) { case 0: return prev()[3]; case 1: return reg[0][3]; case 2: return reg[1][3]; case 3: return reg[2][3]; case 4: return TA; case 5: return rasA; case 6: return ka; default: return 0; }
+        };
+        const outC = [0, 1, 2].map((c) => {
+            const a = cin(st.c[0], c) & 255, b = cin(st.c[1], c) & 255, cc = cin(st.c[2], c) & 255, d = cin(st.c[3], c);
+            return tevOut(a, b, cc, d, st.cop, st.cbias, st.cscale, st.cclamp);
+        });
+        const aa = ain(st.a[0]) & 255, ab = ain(st.a[1]) & 255, ac = ain(st.a[2]) & 255, ad = ain(st.a[3]);
+        const outA = tevOut(aa, ab, ac, ad, st.aop, st.abias, st.ascale, st.aclamp);
+        const cr = st.creg === 0 ? 3 : st.creg - 1, ar = st.areg === 0 ? 3 : st.areg - 1;
+        reg[cr][0] = outC[0]; reg[cr][1] = outC[1]; reg[cr][2] = outC[2];
+        reg[ar][3] = outA;
+    }
+    const out = reg[3].map(clamp8);
+    // the alpha test
+    const at = mat.atest, pa = alphaCmp(at.ca, out[3], at.ra), pb = alphaCmp(at.cb, out[3], at.rb);
+    const pass = at.op === 0 ? pa && pb : at.op === 1 ? pa || pb : at.op === 2 ? pa !== pb : pa === pb;
+    if (!pass) return dst;
+    // the colour written: its intensity (the pass copies the layer back as I8)
+    const src = (out[0] * 77 + out[1] * 150 + out[2] * 29 + 128) >> 8;
+    const b = mat.blend;
+    if (b.mode === 1) {
+        const sf = blendFactor(b.src, false, out[3], src, dst), df = blendFactor(b.dst, true, out[3], src, dst);
+        return clamp8(Math.round((src * sf + dst * df) / 255));
+    }
+    if (b.mode === 3) return clamp8(dst - src);
+    return src;
+}
+
+// ---------------------------------------------------------------- the GPU counts (PollutionCount.cpp)
+// How much goop is left is measured on the GPU. Each frame's draw lists (MarDirectorInitECT.cpp
+// initECTGft) run, before the scene, one counting pass per counter: TPollutionCounterBase::setCallback
+// puts a draw sync token after the draw, and drawSyncCallback (the token's interrupt) reads the PE
+// performance counters, GXReadPixMetric's 5th, clr_pixels_in (pixels into the blender, i.e. past the
+// alpha test), cleared by GXClearPixMetric just before the draw, and stores it less 4 x the draw's
+// triangle count (mPolygonCount: 2 for a layer's quad; SMS_CountPolygonNumInShape for an object) as
+// a u32 (the compares are unsigned: cmplw). The counter's then read by the next frame's movement.
+//  - layers (PerformList "PollutionCountLayer", graffitiGroup's CUE_SEMITRANSPARENT_PRIO_2 | layer i):
+//    viewport and ortho 0..w x 0..h (texture size), drawTex: the texture as a w x h quad, 1:1, NEAR,
+//    after the fade TEV (initGXforPollutionLayer); alpha test GREATER 0. Every texel is one pixel, so
+//    the count is the texels the fade leaves above 0 (not above the layer's threshold).
+//  - objects (PerformList "PollutionCountObj", CUE_UNK1000000: TPollutionCounterObj::countObjDegree,
+//    each TPollutionObj registerPollutionObj'd, up to 30): viewport and ortho 0..512 x 0..512,
+//    PNMTX0 = initCountObjDegree: x / 32 - min.x / 32, z / 32 - min.z / 32 (the joint's box min; y
+//    dropped), the joint's shapes from the layer model's raw positions and UV0, sampling the layer's
+//    texture (I8, NEAR, CLAMP) as it was left by the last layer pass; alpha test TEXA GREATER 0, cull
+//    none, no z. Counted: covered pixels whose texel is above 0.
+// The PE counter's unit: Dolphin (GFX PerfQueriesEnable, which SMS's game INI sets) counts the
+// passing samples and returns them / 4 (PerfQuery::GetQueryResult); that's modelled here. Real
+// hardware counts 2x2 quads with some per-triangle overhead (what the - 4 x triangles takes off);
+// not modelled: unknown exactly.
+/**
+ * Which PE counter to model: 'pixels' (default): a counter in pixels whose per-triangle overhead is
+ * exactly what the game takes off (the counter is the passing pixels); 'dolphin': Dolphin's, passing
+ * pixels / 4 with no per-triangle overhead, so the counter is pixels / 4 - 4 x triangles (wrapping to
+ * ~4e9 below 16 x triangles pixels). Real hardware's isn't known here; 'dolphin' frees Noki Bay
+ * episode 1's first cliff block on the first frame, which the game doesn't, so 'pixels' is the default.
+ */
+export const pixMetricModel = { mode: 'pixels' as 'dolphin' | 'pixels' };
+/** drawSyncCallback: the PE count less 4 x the triangles (mPolygonCount), as a u32. */
+export function pixMetric(pixels: number, tris: number) {
+    if (pixMetricModel.mode === 'pixels') return pixels >>> 0;
+    return ((pixels >> 2) - tris * 4) >>> 0;
+}
+
+/** One TPollutionObj's shapes for the count: screen positions in 28.4 fixed point (Dolphin's rasteriser's, -9), UVs. */
+interface CountMesh { X: Int32Array; Y: Int32Array; U: Float32Array; V: Float32Array; SX: Float32Array; SY: Float32Array; idx: Uint32Array; tris: number; }
+/** registerPollutionObj's object: its layer, joint (in the layer model), box min, and counter. */
+export interface CountObj { layer: Layer; jointIndex: number; min: number[]; mCounter: number; }
+
+/** The layer model's shapes by joint (INF1: a shape's material's joint), with raw positions and UV0. */
+/** a shape's matrix group: raw positions, UV0, triangles, and SMS_CountPolygonNumInShape's count */
+interface MeshPart { pos: Float32Array; uv: Float32Array | null; idx: Uint32Array; polys: number; }
+const jointShapeCache = new WeakMap<Uint8Array, Map<number, MeshPart[]>>();
+function jointShapes(b: Uint8Array) {
+    let r = jointShapeCache.get(b);
+    if (r) return r;
+    r = new Map();
+    try {
+        const bmd = BMD.parse(new ArrayBufferSlice(b.buffer as ArrayBuffer, b.byteOffset, b.byteLength));
+        const hv = bmd.inf1.hierarchyData.createDataView();
+        const shapeJoint: number[] = [];
+        const stack: number[] = [];
+        let lastJoint = -1;
+        for (let o = 0; o + 4 <= hv.byteLength; o += 4) {
+            const type = hv.getUint16(o), value = hv.getUint16(o + 2);
+            if (type === 0) break;
+            if (type === 1) { stack.push(lastJoint >= 0 ? lastJoint : stack.length ? stack[stack.length - 1] : -1); lastJoint = -1; }
+            else if (type === 2) { stack.pop(); lastJoint = -1; }
+            else if (type === 0x10) lastJoint = value;
+            else if (type === 0x11) lastJoint = -1;
+            else if (type === 0x12) shapeJoint[value] = lastJoint >= 0 ? lastJoint : stack.length ? stack[stack.length - 1] : -1;
+        }
+        bmd.shp1.shapes.forEach((sh, si) => {
+            const j = shapeJoint[si];
+            if (j === undefined || j < 0) return;
+            for (const mg of sh.mtxGroups) {
+                const lvd = mg.loadedVertexData, n = lvd.totalVertexCount, lay = sh.loadedVertexLayout;
+                const p4 = readAttr(lay, lvd.vertexBuffers, VertexAttributeInput.POS, n, 4)!;
+                const pos = new Float32Array(n * 3);
+                for (let i = 0; i < n; i++) { pos[i * 3] = p4[i * 4]; pos[i * 3 + 1] = p4[i * 4 + 1]; pos[i * 3 + 2] = p4[i * 4 + 2]; }
+                const ib = lay.indexFormat === GfxFormat.U32_R ? new Uint32Array(lvd.indexData as ArrayBuffer) : new Uint16Array(lvd.indexData as ArrayBuffer);
+                const base = lvd.vertexId - n, idx = new Uint32Array(lvd.totalIndexCount);
+                for (let i = 0; i < idx.length; i++) idx[i] = ib[i] - base;
+                let L = r!.get(j);
+                if (!L) r!.set(j, L = []);
+                // SMS_CountPolygonNumInShape: n - 2 for each strip / fan, up to the first other command
+                let polys = 0;
+                for (const d of lvd.drawCalls || []) { if (d.primType !== 0x98 && d.primType !== 0xA0) break; polys += d.vertexCount - 2; }
+                L.push({ pos, uv: readAttr(lay, lvd.vertexBuffers, VertexAttributeInput.TEX01, n, 2), idx, polys });
+            }
+        });
+    } catch (e) { console.warn('[game] pollution obj shapes', e); }
+    jointShapeCache.set(b, r);
+    return r;
+}
+/** Dolphin's SW rasteriser's iround (Rasterizer.cpp) */
+const iround = (x: number) => { const t = Math.trunc(x); return x - t >= 0.5 ? t + 1 : t; };
+/** initCountObjDegree's matrix, the 512 x 512 ortho and viewport, in f32: the object's mesh on screen. */
+function countMesh(o: CountObj, shapes: MeshPart[]): CountMesh {
+    const sc = fr(0.03125), tx = fr(-o.min[0] / 32), tz = fr(-o.min[2] / 32), inv256 = fr(1 / 256);
+    let nv = 0, ni = 0, polys = 0;
+    for (const s of shapes) { nv += s.pos.length / 3; ni += s.idx.length; polys += s.polys; }
+    const X = new Int32Array(nv), Y = new Int32Array(nv), SX = new Float32Array(nv), SY = new Float32Array(nv), U = new Float32Array(nv), V = new Float32Array(nv), idx = new Uint32Array(ni);
+    let v0 = 0, i0 = 0;
+    for (const s of shapes) {
+        const n = s.pos.length / 3;
+        for (let i = 0; i < n; i++) {
+            const px = fr(fr(sc * s.pos[i * 3]) + tx), py = fr(fr(sc * s.pos[i * 3 + 2]) + tz);
+            // C_MTXOrtho(0, 512, 0, 512): ndc x = x / 256 - 1, y = 1 - y / 256; viewport 512 x 512 at 0
+            // (xOrig 256 + 342, wd 256; yOrig 256 + 342, ht -256; less the scissor offset 342)
+            const nx = fr(fr(px * inv256) - 1), ny = fr(1 - fr(py * inv256));
+            const sx = fr(fr(fr(nx * 256) + 598) - 342), sy = fr(fr(fr(ny * -256) + 598) - 342);
+            SX[v0 + i] = sx; SY[v0 + i] = sy;
+            X[v0 + i] = iround(fr(16 * sx)) - 9; Y[v0 + i] = iround(fr(16 * sy)) - 9;
+            U[v0 + i] = s.uv ? s.uv[i * 2] : 0; V[v0 + i] = s.uv ? s.uv[i * 2 + 1] : 0;
+        }
+        for (let k = 0; k < s.idx.length; k++) idx[i0 + k] = s.idx[k] + v0;
+        v0 += n; i0 += s.idx.length;
+    }
+    return { X, Y, SX, SY, U, V, idx, tris: polys };
+}
+/**
+ * One triangle rasterised as Dolphin's software renderer does (Rasterizer.cpp DrawTriangleFrontFace,
+ * "adjusted to match hardware output"): 28.4 fixed point vertices less 9/16, half-space edges with
+ * the top-left fill convention, pixel (x, y) tested at (x, y) << 4; a back face's v1 and v2 swapped
+ * (cull none). Calls px for each covered pixel inside 0..W x 0..H.
+ */
+function rasterCount(m: CountMesh, a: number, b: number, c: number, W: number, H: number, px: (x: number, y: number, s: number, t: number) => void) {
+    let X1 = m.X[a], Y1 = m.Y[a], X2 = m.X[b], Y2 = m.Y[b], X3 = m.X[c], Y3 = m.Y[c];
+    // the clipper's facing (screen space, y down): swap so the edge functions are positive inside
+    if ((X2 - X1) * (Y3 - Y1) - (Y2 - Y1) * (X3 - X1) > 0) { let t = X2; X2 = X3; X3 = t; t = Y2; Y2 = Y3; Y3 = t; const u = b; b = c; c = u; }
+    const DX12 = X1 - X2, DX23 = X2 - X3, DX31 = X3 - X1, DY12 = Y1 - Y2, DY23 = Y2 - Y3, DY31 = Y3 - Y1;
+    let minx = (Math.min(X1, X2, X3) + 0xF) >> 4, maxx = (Math.max(X1, X2, X3) + 0xF) >> 4;
+    let miny = (Math.min(Y1, Y2, Y3) + 0xF) >> 4, maxy = (Math.max(Y1, Y2, Y3) + 0xF) >> 4;
+    minx = Math.max(minx, 0); maxx = Math.min(maxx, W); miny = Math.max(miny, 0); maxy = Math.min(maxy, H);
+    if (minx >= maxx || miny >= maxy) return;
+    let C1 = DY12 * X1 - DX12 * Y1, C2 = DY23 * X2 - DX23 * Y2, C3 = DY31 * X3 - DX31 * Y3;
+    if (DY12 < 0 || (DY12 === 0 && DX12 > 0)) C1++;
+    if (DY23 < 0 || (DY23 === 0 && DX23 > 0)) C2++;
+    if (DY31 < 0 || (DY31 === 0 && DX31 > 0)) C3++;
+    // the attributes' plane, at the pixel's (x, y) + 0.495 (SlopeContext's adjust)
+    const sx0 = m.SX[a], sy0 = m.SY[a], dx10 = fr(m.SX[b] - sx0), dx20 = fr(m.SX[c] - sx0), dy10 = fr(m.SY[b] - sy0), dy20 = fr(m.SY[c] - sy0);
+    const det = dx10 * dy20 - dx20 * dy10;
+    if (det === 0) return;
+    for (let y = miny; y < maxy; y++) {
+        const y0 = y << 4;
+        for (let x = minx; x < maxx; x++) {
+            const x0 = x << 4;
+            if (C1 + DX12 * y0 - DY12 * x0 > 0 && C2 + DX23 * y0 - DY23 * x0 > 0 && C3 + DX31 * y0 - DY31 * x0 > 0) {
+                const ex = x + 0.495 - sx0, ey = y + 0.495 - sy0;
+                // barycentric weights of b and c at the sample
+                const wb = (ex * dy20 - ey * dx20) / det, wc = (ey * dx10 - ex * dy10) / det;
+                px(x, y, m.U[a] + wb * (m.U[b] - m.U[a]) + wc * (m.U[c] - m.U[a]), m.V[a] + wb * (m.V[b] - m.V[a]) + wc * (m.V[c] - m.V[a]));
+            }
+        }
+    }
+}
+
+const meshCache = new WeakMap<CountObj, CountMesh>();
+const texelCache = new WeakMap<CountMesh, Int32Array>();
+/**
+ * TPollutionCounterObj::draw + drawSyncCallback for one object: its triangles over the 512 x 512
+ * pass, each covered pixel's texel (NEAR: floor(s x w), CLAMP) of the layer's texture tested > 0.
+ */
+export function countObjDegree(o: CountObj, files: Files): number {
+    const L = o.layer, P = L.pos, M = L.map;
+    let m = meshCache.get(o);
+    if (!m) {
+        const b = files.scene(`map/pollution/${L.name}.bmd`);
+        m = countMesh(o, b ? jointShapes(b).get(o.jointIndex) || [] : []);
+        meshCache.set(o, m);
+    }
+    // (the mesh is fixed, so which texel each covered pixel samples is too: rasterized once, then
+    // each frame only the texels are tested)
+    let T = texelCache.get(m);
+    if (!T) {
+        const W = P.w, H = P.h, out: number[] = [];
+        const px = (_x: number, _y: number, s: number, t: number) => {
+            let u = Math.floor(s * W), v = Math.floor(t * H);
+            u = u < 0 ? 0 : u >= W ? W - 1 : u; v = v < 0 ? 0 : v >= H ? H - 1 : v;
+            out.push(P.index(u, v));
+        };
+        for (let k = 0; k + 2 < m.idx.length; k += 3) rasterCount(m, m.idx[k], m.idx[k + 1], m.idx[k + 2], 512, 512, px);
+        // (each texel once, with how many pixels sample it)
+        const cnt = new Map<number, number>();
+        for (const i of out) cnt.set(i, (cnt.get(i) || 0) + 1);
+        T = new Int32Array(cnt.size * 2);
+        let j = 0;
+        for (const [i, c] of cnt) { T[j++] = i; T[j++] = c; }
+        texelCache.set(m, T);
+    }
+    let n = 0;
+    for (let k = 0; k < T.length; k += 2) if (M[T[k]]) n += T[k + 1];
+    return pixMetric(n, m.tris);
+}
+/** TMapEventSink::mCleanedDegree (u32 static, 10; mapevent.ts's sinkStatics) */
+export const sinkCleaned = { mCleanedDegree: 10 };
+
+/** TPollutionManager ("落書き管理") */
+export class Pollution {
+    layers: Layer[] = [];
+    /** Stamp shapes by stamp type: 0 clean (common/map/clean.bti), 1 pollute (pollute.bti), 2+ registered by enemies. */
+    stampTex: (Img | null)[] = [];
+    private stampTypes: number[] = [0, 1];
+    /** each stamp type's queue: its capacity (registerTexStamp's) and the tasks in it this frame */
+    private taskCap: number[] = [0xFF, 0xFF];
+    private taskNum: number[] = [0, 0];
+    private modelTaskNum = 0;
+    constructor(public files: Files, map: number, stage: number, common: (p: string) => Uint8Array | null) {
+        const ymp = files.scene('map/ymap.ymp');
+        if (!ymp) return;
+        const v = new DataView(ymp.buffer, ymp.byteOffset, ymp.byteLength);
+        const n = v.getUint16(0), infos = v.getUint32(4);
+        const names = map === 9 && stage !== 7
+            ? ['pollution00', 'pollution01', 'pollution02', 'pollution03', 'pollution04', 'pollution05', 'pollution06', 'pollutionA', 'pollutionB']
+            : Array.from({ length: 20 }, (_, i) => 'pollution' + String(i).padStart(2, '0'));
+        for (let i = 0; i < n && i < names.length; i++) {
+            const o = infos + i * 0x2C;
+            const plane = v.getUint16(o + 4);
+            if (plane > 6) continue;
+            const L = new Layer(this, this.layers.length, plane, names[i]);
+            L.initLayerInfo(v.getUint16(o), v.getUint16(o + 2), v.getFloat32(o + 0x10), v.getFloat32(o + 0x14), v.getFloat32(o + 0x18), v.getFloat32(o + 0x1C));
+            const lw = v.getUint16(o + 0x20), lh = v.getUint16(o + 0x22);
+            const hm = v.getUint32(o + 0x28);
+            // (a copy: TPollutionObj::updateDepthMap writes it, and the game reloads the file with the stage)
+            L.pos.init(v.getFloat32(o + 8), v.getFloat32(o + 0xC), ymp.slice(hm, hm + (1 << lw) * (1 << lh)), lw, lh);
+            // the texture: the layer model's texture 0 (the wave layer: its own .bti); I8 in the same tiles
+            const tex = plane === 6 ? null : bmdTexture0(files.scene(`map/pollution/${names[i]}.bmd`) || new Uint8Array(0));
+            L.map = new Uint8Array((1 << lw) * (1 << lh));
+            if (tex && tex.fmt === 1) L.map.set(tex.data.subarray(tex.off, tex.off + L.map.length));
+            L.initTexImage(files.scene(`map/pollution/${names[i]}.bmp`), map === 9);
+            this.layers.push(L);
+        }
+        const bti = (p: string) => { const b = common(p); return b ? parseBTI(b) : null; };
+        this.stampTex[0] = bti('map/clean.bti');
+        this.stampTex[1] = bti('map/pollute.bti');
+    }
+    /**
+     * TPollutionCounterLayer::registerTexStamp(kind, capacity, tex): another stamp shape (an enemy's
+     * mark; TSmallEnemyManager passes its mCapacity). Its stamp type.
+     */
+    registerTexStamp(kind: number, img: Img | null, capacity = 0xFF) {
+        this.stampTypes.push(kind); this.stampTex.push(img); this.taskCap.push(capacity); this.taskNum.push(0);
+        for (const L of this.layers) L.tasks.push([]);
+        return this.stampTypes.length - 1;
+    }
+    stampIsCleanType(type: number) { return this.stampTypes[type] === 0; }
+    stampKind(type: number) { return this.stampTypes[type]; }
+    /**
+     * TPollutionTexStamp::pushTask: one queue per stamp type for all the layers (each task names its
+     * layer; doTask draws a layer's own), full at the type's capacity (0xFF for clean and pollute)
+     * until the frame's draw empties it (resetTask).
+     */
+    pushStampTask(type: number, L: Layer, size: number, x: number, z: number, y: number) {
+        const q = L.tasks[type];
+        if (!q || this.taskNum[type] >= this.taskCap[type]) return;
+        this.taskNum[type]++;
+        q.push({ x: x & 0xFFFF, z: z & 0xFFFF, size: size & 0xFFFF, y: (y << 16) >> 16 });
+    }
+    stamp(type: number, x: number, y: number, z: number, size: number) { for (const L of this.layers) L.stamp(type, x, y, z, size); }
+    clean(x: number, y: number, z: number, size: number, map: number) { if (map === 1 && y < -10) return; this.stamp(0, x, y, z, size); }
+    stampGround(type: number, x: number, y: number, z: number, size: number) { for (const L of this.layers) if (L.planeType === 0) L.stamp(type, x, y, z, size); }
+    /**
+     * stampModel(J3DModel*): the model (its MActor, posed now: base TR matrix and scale, the BCK at
+     * its frame) drawn into the ground layers whose box holds its base translation.
+     */
+    stampModel(a: MActor, baseTR: Mtx, scale: { x: number; y: number; z: number }) {
+        const x = baseTR[3], z = baseTR[11];
+        let joints: mat4[] | null = null, m: SModel | null = null;
+        for (const L of this.layers) {
+            if (L.planeType !== 0) continue;
+            if (x < L.minX || z < L.minZ || x >= L.maxX || z >= L.maxZ) continue;
+            // pushModelStampTask: 20 a frame
+            if (this.modelTaskNum >= 20) return;
+            if (!m) {
+                const b = this.files.scene(a.model);
+                m = b ? loadStampModel(b) : null;
+                if (!m) return;
+                joints = a.anmMtxAll(baseTR, scale as any);
+                if (!joints) return;
+            }
+            this.modelTaskNum++;
+            L.modelTasks.push({ m, draw: drawMatrices(m, joints!), rows: drawRows(m, joints!) });
+        }
+    }
+    isPolluted(x: number, y: number, z: number) { for (const L of this.layers) if (L.isPolluted(x, y, z)) return true; return false; }
+    getPollutionType(x: number, y: number, z: number) { for (const L of this.layers) if (L.isInArea(x, y, z)) return L.type; return POLLUTION_TYPE.UNK10; }
+    /** getPollutionDegree: the layers' counters summed (u32) */
+    getPollutionDegree() { let n = 0; for (const L of this.layers) n = (n + L.degree()) >>> 0; return n; }
+    /** cleanedAll: under TMapEventSink::mCleanedDegree (unsigned) */
+    cleanedAll() { return this.getPollutionDegree() < sinkCleaned.mCleanedDegree; }
+    /** TPollutionCounterLayer::onLayer / offLayer (offLayer zeroes its counter) */
+    onLayer(i: number) { const L = this.layers[i]; if (L) L.counterOn = true; }
+    offLayer(i: number) { const L = this.layers[i]; if (L) { L.counterOn = false; L.mCounter = 0; } }
+    /** TPollutionCounterObj (init(30)): the objects counted each frame */
+    private counterObjs: CountObj[] = [];
+    /** registerPollutionObj: counted from the next frame's pass; its counter -1 till then */
+    registerPollutionObj(o: CountObj) { if (this.counterObjs.length >= 30) return; this.counterObjs.push(o); o.mCounter = 0xFFFFFFFF; }
+    /** The graffiti group's movement: each layer's action. */
+    move(mario: { x: number, y: number, z: number }) { for (const L of this.layers) L.action(mario); }
+    /** The frame's draw: fades, stamps, then the queues empty (resetTask). */
+    draw() {
+        // PerformList PollutionCountObj (the objects, over the textures as the last frame left them),
+        // then PollutionCountLayer (each layer's fade, count, stamps)
+        for (const o of this.counterObjs) o.mCounter = countObjDegree(o, this.files);
+        for (const L of this.layers) L.countTexDegree();
+        for (const L of this.layers) { for (const q of L.tasks) q.length = 0; L.modelTasks.length = 0; }
+        this.taskNum.fill(0);
+        this.modelTaskNum = 0;
+    }
+}

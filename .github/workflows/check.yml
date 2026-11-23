@@ -1,0 +1,31 @@
+name: Check
+# On every push and pull request: the type-check against its baseline, site/ against a fresh build,
+# and the built page in headless Chrome. No game data is used (the site hosts none).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Type-check (no new errors)
+        run: node tools/ci/typecheck.mjs
+      - name: The page's own script has no undefined names
+        run: node tools/ci/pagescript.mjs
+      - name: Build the site from the sources
+        run: node build.mjs
+      - name: The page loads without errors
+        run: bash tools/ci/pagecheck.sh ../site
